@@ -1,0 +1,2 @@
+ALTER TABLE player_inventory
+    ADD COLUMN IF NOT EXISTS amount INT NOT NULL DEFAULT 1;
