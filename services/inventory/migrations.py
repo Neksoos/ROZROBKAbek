@@ -104,7 +104,7 @@ async def ensure_player_inventory_columns() -> None:
             """
         )
 
-        # 2) ✅ ВАЖЛИВО: спочатку підчистити "биті" екземпляри екіпу, які колись стали slot=NULL
+        # 2) Підчистити "биті" екземпляри екіпу, які колись стали slot=NULL
         #    (щоб створення partial-unique для стеків не падало)
         await conn.execute(
             """
@@ -120,7 +120,7 @@ async def ensure_player_inventory_columns() -> None:
         )
 
         # 3) partial unique index для стеків:
-        #    дозволяє 1 рядок на (tg_id,item_id) тільки коли slot NULL і не екіп
+        #    рівно 1 рядок на (tg_id,item_id) тільки коли slot NULL і не екіп
         await conn.execute(
             """
             DO $$
@@ -141,7 +141,7 @@ async def ensure_player_inventory_columns() -> None:
             """
         )
 
-        # 4) (супер корисно) гарантує, що в одному слоті може бути лише 1 екіп (на гравця)
+        # 4) гарантує, що в одному слоті може бути лише 1 екіп (на гравця)
         await conn.execute(
             """
             DO $$
