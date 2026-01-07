@@ -37,18 +37,20 @@ async def get_materials(tg_id: int) -> MaterialsResponse:
             SELECT
               pm.material_id,
               pm.qty,
-              i.code,
-              i.name,
-              i.rarity,
-              i.category
+              cm.code,
+              cm.name,
+              cm.rarity,
+              cm.profession,
+              cm.source_type
             FROM player_materials pm
-            JOIN items i ON i.id = pm.material_id
+            JOIN craft_materials cm ON cm.id = pm.material_id
             WHERE pm.tg_id = $1
               AND pm.qty > 0
             ORDER BY
-              i.category NULLS LAST,
-              i.rarity NULLS LAST,
-              i.name ASC
+              cm.profession NULLS LAST,
+              cm.source_type NULLS LAST,
+              cm.rarity NULLS LAST,
+              cm.name ASC
             """,
             tg_id,
         )
@@ -60,7 +62,8 @@ async def get_materials(tg_id: int) -> MaterialsResponse:
             name=str(r["name"]),
             qty=int(r["qty"] or 0),
             rarity=r["rarity"],
-            category=r["category"],
+            # ⚠️ раніше тут була items.category; для craft_materials віддаємо profession
+            category=r["profession"],
             icon=f"{str(r['code'])}.png" if r["code"] else None,
         )
         for r in rows
