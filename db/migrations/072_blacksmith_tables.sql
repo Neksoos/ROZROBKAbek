@@ -105,7 +105,7 @@ CREATE INDEX IF NOT EXISTS idx_blacksmith_ing_recipe
 DO $$
 BEGIN
   IF to_regclass('public.blacksmith_recipes_old') IS NOT NULL THEN
-    EXECUTE $$
+    EXECUTE $m$
       INSERT INTO blacksmith_recipes (
         code, name, prof_key, level_req, craft_time_sec,
         output_kind, output_code, output_amount,
@@ -125,11 +125,11 @@ BEGIN
         '{}'::jsonb AS json_data
       FROM blacksmith_recipes_old r
       ON CONFLICT (code) DO NOTHING;
-    $$;
+    $m$;
   END IF;
 
   IF to_regclass('public.blacksmith_recipe_ingredients_old') IS NOT NULL THEN
-    EXECUTE $$
+    EXECUTE $m$
       INSERT INTO blacksmith_recipe_ingredients (recipe_code, input_kind, input_code, qty, role)
       SELECT
         i.recipe_code,
@@ -139,7 +139,7 @@ BEGIN
         COALESCE(i.role,'main') AS role
       FROM blacksmith_recipe_ingredients_old i
       ON CONFLICT DO NOTHING;
-    $$;
+    $m$;
   END IF;
 END $$;
 
