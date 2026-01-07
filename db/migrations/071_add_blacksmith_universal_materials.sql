@@ -1,10 +1,9 @@
 -- 071_add_blacksmith_universal_materials.sql
 -- Додає універсальні матеріали для ковальства у craft_materials.
--- ВАЖЛИВО: цей файл має бути незалежний від наявності таблиць blacksmith_*.
+-- Незалежний від таблиць blacksmith_*.
 
 BEGIN;
 
--- schema: craft_materials(code, name, descr, profession, source_type, rarity, created_at, updated_at)
 INSERT INTO craft_materials (code, name, descr, profession, source_type, rarity)
 VALUES
 (
