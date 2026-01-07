@@ -70,12 +70,11 @@ async def give_item_to_player_repo(
                 category,
                 emoji,
                 rarity,
-                slot_norm,  # для стекових може бути None; для екіпу бажано мати slot
+                slot_norm,
                 stats_json,
                 stack_flag,
                 description,
             )
-
             item_row = await conn.fetchrow(
                 "SELECT id, stackable, slot, category FROM items WHERE code = $1",
                 item_code,
@@ -85,11 +84,12 @@ async def give_item_to_player_repo(
             raise HTTPException(500, "ITEM_CREATE_FAILED")
 
         item_id = int(item_row["id"])
-        item_slot = normalize_slot(item_row["slot"])  # canonical slot з items
-        stack = bool(item_row["stackable"]) if "stackable" in item_row else stackable(category)
+        item_slot = normalize_slot(item_row["slot"])
+        stack_flag = bool(item_row["stackable"]) if "stackable" in item_row else stackable(category)
 
-        # ✅ Стек дозволяємо ТІЛЬКИ якщо предмет stackable і в items.slot НЕ заданий (тобто це НЕ екіп)
-        if stack and item_slot is None:
+        # ✅ Стек дозволяємо ТІЛЬКИ якщо предмет stackable і В items.slot НЕ заданий (тобто це НЕ екіп)
+        if stack_flag and item_slot is None:
+            # Тримаємо всі стеки в slot=NULL (не екіп)
             try:
                 await conn.execute(
                     """
@@ -133,8 +133,8 @@ async def give_item_to_player_repo(
                     )
                 return
 
-        # ✅ Не-стек (екіп або інші штучні екземпляри):
-        # slot НІКОЛИ не NULL. Беремо items.slot, інакше fallback slot_norm.
+        # ✅ Не-стек (екіп або інші екземпляри):
+        # slot НІКОЛИ не NULL. Беремо items.slot, інакше (fallback) slot_norm.
         final_slot = item_slot or slot_norm
         if not final_slot:
             raise HTTPException(400, "ITEM_HAS_NO_SLOT")
@@ -152,6 +152,11 @@ async def give_item_to_player_repo(
 
 
 async def equip_repo(inv_id: int, tg_id: int) -> None:
+    """
+    Важливо:
+    - НЕ робимо slot=NULL при unequip (інакше це починає конфліктувати зі стеками/індексами)
+    - swap робимо без проміжного стану, який ламає унікальні індекси
+    """
     await ensure_items_columns()
     await ensure_player_inventory_columns()
 
@@ -164,8 +169,9 @@ async def equip_repo(inv_id: int, tg_id: int) -> None:
                   pi.id AS inv_id,
                   pi.tg_id,
                   COALESCE(pi.qty,1) AS qty,
-                  pi.is_equipped,
+                  COALESCE(pi.is_equipped,FALSE) AS is_equipped,
                   pi.slot AS inv_slot,
+                  pi.item_id AS item_id,
                   i.slot AS item_slot
                 FROM player_inventory pi
                 JOIN items i ON i.id = pi.item_id
@@ -182,14 +188,14 @@ async def equip_repo(inv_id: int, tg_id: int) -> None:
             if int(row["qty"] or 1) != 1:
                 raise HTTPException(400, "CANNOT_EQUIP_STACK")
 
-            slot = normalize_slot(row["item_slot"])
+            slot = normalize_slot(row["item_slot"] or row["inv_slot"])
             if not slot:
                 raise HTTPException(400, "ITEM_HAS_NO_SLOT")
 
-            # ✅ лочимо поточний екіп у слоті (для чистого swap)
-            await conn.execute(
+            # Лочимо поточний екіп у слоті (якщо є)
+            cur = await conn.fetchrow(
                 """
-                SELECT 1
+                SELECT id
                 FROM player_inventory
                 WHERE tg_id = $1
                   AND slot = $2
@@ -200,22 +206,24 @@ async def equip_repo(inv_id: int, tg_id: int) -> None:
                 slot,
             )
 
-            # 1) знімаємо поточний екіп зі слоту
-            # ⚠️ НЕ ставимо slot=NULL
-            await conn.execute(
-                """
-                UPDATE player_inventory
-                SET is_equipped = FALSE,
-                    updated_at = NOW()
-                WHERE tg_id = $1
-                  AND slot = $2
-                  AND is_equipped = TRUE
-                """,
-                tg_id,
-                slot,
-            )
+            # Якщо вже екіпнуто саме цей inv_id — нічого не робимо
+            if cur and int(cur["id"]) == int(inv_id):
+                return
 
-            # 2) екіпуємо обраний предмет
+            # 1) знімаємо поточний екіп (ТОЧКОВО по id)
+            if cur:
+                await conn.execute(
+                    """
+                    UPDATE player_inventory
+                    SET is_equipped = FALSE,
+                        updated_at = NOW()
+                    WHERE id = $1 AND tg_id = $2
+                    """,
+                    int(cur["id"]),
+                    tg_id,
+                )
+
+            # 2) екіпуємо обраний
             await conn.execute(
                 """
                 UPDATE player_inventory
@@ -236,7 +244,7 @@ async def unequip_repo(inv_id: int, tg_id: int) -> None:
 
     pool = await get_pool()
     async with pool.acquire() as conn:
-        # ⚠️ НЕ ставимо slot=NULL
+        # ⚠️ НЕ СТАВИМО slot=NULL
         await conn.execute(
             """
             UPDATE player_inventory
@@ -259,7 +267,7 @@ async def unequip_slot_repo(slot: str, tg_id: int) -> None:
 
     pool = await get_pool()
     async with pool.acquire() as conn:
-        # ⚠️ НЕ ставимо slot=NULL
+        # ⚠️ НЕ СТАВИМО slot=NULL
         await conn.execute(
             """
             UPDATE player_inventory
