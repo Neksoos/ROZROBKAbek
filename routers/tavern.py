@@ -12,7 +12,9 @@ from db import get_pool
 from services.char_stats import get_full_stats_for_player  # type: ignore
 from services.daily_login import process_daily_login  # type: ignore
 
-from .inventory import _ensure_items_columns as _ensure_items_base  # type: ignore
+# ✅ FIX: більше НЕ тягнемо legacy приватну функцію з routers.inventory
+from services.inventory.migrations import ensure_items_columns as _ensure_items_base  # type: ignore
+
 from core.tg_auth import get_tg_user  # ✅ initData auth
 
 router = APIRouter(prefix="/api/tavern", tags=["tavern"])
