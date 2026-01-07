@@ -66,8 +66,50 @@ async def ensure_player_inventory_columns() -> None:
             """
         )
         await conn.execute("""UPDATE player_inventory SET qty = 1 WHERE qty IS NULL OR qty = 0;""")
+        await conn.execute("""UPDATE player_inventory SET is_equipped = FALSE WHERE is_equipped IS NULL;""")
 
-        # partial unique index для стекабельних (tg_id,item_id) коли slot NULL і не екіп
+        # ─────────────────────────────────────────────
+        # ВАЖЛИВО:
+        # 1) Прибрати legacy UNIQUE (tg_id,item_id), бо він заважає мати 2 однакові екземпляри екіпу.
+        #    Нам потрібен UNIQUE тільки для стеків: slot IS NULL AND is_equipped=FALSE.
+        # ─────────────────────────────────────────────
+        await conn.execute(
+            """
+            DO $$
+            DECLARE
+              c_name text;
+              i_name text;
+            BEGIN
+              -- 1) drop constraint типу UNIQUE(tg_id,item_id), якщо він існує
+              SELECT conname INTO c_name
+              FROM pg_constraint
+              WHERE conrelid = 'player_inventory'::regclass
+                AND contype = 'u'
+                AND pg_get_constraintdef(oid) ILIKE '%(tg_id, item_id)%'
+              LIMIT 1;
+
+              IF c_name IS NOT NULL THEN
+                EXECUTE format('ALTER TABLE player_inventory DROP CONSTRAINT %I', c_name);
+              END IF;
+
+              -- 2) drop unique index (НЕ partial), якщо хтось колись робив UNIQUE INDEX на (tg_id,item_id)
+              SELECT indexname INTO i_name
+              FROM pg_indexes
+              WHERE schemaname = current_schema()
+                AND tablename = 'player_inventory'
+                AND indexdef ILIKE '%UNIQUE%'
+                AND indexdef ILIKE '%(tg_id, item_id)%'
+                AND indexdef NOT ILIKE '%WHERE slot IS NULL AND is_equipped = false%'
+              LIMIT 1;
+
+              IF i_name IS NOT NULL THEN
+                EXECUTE format('DROP INDEX IF EXISTS %I', i_name);
+              END IF;
+            END $$;
+            """
+        )
+
+        # 3) partial unique index для стеків (tg_id,item_id) коли slot NULL і не екіп
         await conn.execute(
             """
             DO $$
@@ -75,7 +117,8 @@ async def ensure_player_inventory_columns() -> None:
               IF NOT EXISTS (
                 SELECT 1
                 FROM pg_indexes
-                WHERE indexname = 'uq_player_inventory_stack'
+                WHERE schemaname = current_schema()
+                  AND indexname = 'uq_player_inventory_stack'
               ) THEN
                 EXECUTE '
                   CREATE UNIQUE INDEX uq_player_inventory_stack
@@ -84,6 +127,22 @@ async def ensure_player_inventory_columns() -> None:
                 ';
               END IF;
             END $$;
+            """
+        )
+
+        # 4) (Опційно, але дуже корисно) підчистити "битий" екіп,
+        # який колись став slot=NULL через стару логіку unequip/equip.
+        # Це не робить їх стекабельними — просто повертає slot з items.slot.
+        await conn.execute(
+            """
+            UPDATE player_inventory pi
+            SET slot = i.slot,
+                updated_at = NOW()
+            FROM items i
+            WHERE i.id = pi.item_id
+              AND pi.slot IS NULL
+              AND COALESCE(i.slot,'') <> ''
+              AND COALESCE(pi.is_equipped, FALSE) = FALSE;
             """
         )
 
