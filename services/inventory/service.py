@@ -20,9 +20,9 @@ from services.inventory.utils import (
     pick_emoji,
 )
 
-
-async def give_item_to_player(**kwargs) -> None:
-    await give_item_to_player_repo(**kwargs)
+# ✅ FIX: приймаємо tg_id позиційно + решту як kwargs, і прокидуємо в repo
+async def give_item_to_player(tg_id: int, **kwargs) -> None:
+    await give_item_to_player_repo(tg_id=tg_id, **kwargs)
 
 
 async def list_inventory(tg_id: int) -> InventoryListResponse:
