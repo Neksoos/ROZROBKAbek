@@ -1,176 +1,247 @@
-begin;
+-- 072_blacksmith_tables.sql
+-- Таблиці та DB-функції для ковальства (smelt/forge) з таймером та чергою.
+--
+-- Важливо про міграції в цьому проєкті:
+-- - run_migrations() виконує ВСІ *.sql при кожному старті.
+-- - тому все тут має бути ідемпотентним (IF NOT EXISTS / guarded DO blocks).
+
+BEGIN;
 
 -- =========================================================
--- 0) player_materials: унікальність (tg_id, material_id)
---    Потрібно для коректного UPSERT у крафтових професіях.
+-- 0) Legacy-guard: якщо десь лишилась стара схема blacksmith_recipes
+--    (із slot/forge_hits/output_item_code), ми НЕ дропаємо її (бо міграції
+--    виконуються на кожному старті), а переносимо в *_old лише ОДИН раз.
 -- =========================================================
 
--- 0.1) Дедуплікація на випадок, якщо вже є дублікати
-with agg as (
-  select tg_id, material_id, min(id) as keep_id, sum(qty) as total_qty
-  from player_materials
-  group by tg_id, material_id
-  having count(*) > 1
-),
-upd as (
-  update player_materials pm
-  set qty = agg.total_qty,
-      updated_at = now()
-  from agg
-  where pm.id = agg.keep_id
-  returning pm.id
-)
-delete from player_materials pm
-using agg
-where pm.tg_id = agg.tg_id
-  and pm.material_id = agg.material_id
-  and pm.id <> agg.keep_id;
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1
+    FROM information_schema.tables
+    WHERE table_schema = 'public' AND table_name = 'blacksmith_recipes'
+  )
+  AND NOT EXISTS (
+    SELECT 1
+    FROM information_schema.columns
+    WHERE table_schema = 'public'
+      AND table_name = 'blacksmith_recipes'
+      AND column_name = 'output_kind'
+  )
+  AND NOT EXISTS (
+    SELECT 1
+    FROM information_schema.tables
+    WHERE table_schema = 'public' AND table_name = 'blacksmith_recipes_old'
+  )
+  THEN
+    ALTER TABLE blacksmith_recipes RENAME TO blacksmith_recipes_old;
+  END IF;
 
--- 0.2) Додаємо унікальний індекс (tg_id, material_id) якщо ще нема
-do $$
-begin
-  if not exists (
-    select 1 from pg_indexes
-    where schemaname = 'public'
-      and indexname = 'uq_player_materials_tg_material'
-  ) then
-    create unique index uq_player_materials_tg_material
-      on player_materials (tg_id, material_id);
-  end if;
-end $$;
+  IF EXISTS (
+    SELECT 1
+    FROM information_schema.tables
+    WHERE table_schema = 'public' AND table_name = 'blacksmith_recipe_ingredients'
+  )
+  AND NOT EXISTS (
+    SELECT 1
+    FROM information_schema.columns
+    WHERE table_schema = 'public'
+      AND table_name = 'blacksmith_recipe_ingredients'
+      AND column_name = 'input_kind'
+  )
+  AND NOT EXISTS (
+    SELECT 1
+    FROM information_schema.tables
+    WHERE table_schema = 'public' AND table_name = 'blacksmith_recipe_ingredients_old'
+  )
+  THEN
+    ALTER TABLE blacksmith_recipe_ingredients RENAME TO blacksmith_recipe_ingredients_old;
+  END IF;
+END $$;
+
 
 -- =========================================================
--- 1) Blacksmith: рецепти + інгредієнти
+-- 1) Blacksmith: recipes + ingredients (новий формат)
 -- =========================================================
 
-create table if not exists blacksmith_recipes (
-  code            text primary key,
-  name            text not null,
-  prof_key        text not null default 'blacksmith',
-  level_req       int  not null default 1,
-  craft_time_sec  int  not null check (craft_time_sec > 0),
+CREATE TABLE IF NOT EXISTS blacksmith_recipes (
+  code            text PRIMARY KEY,
+  name            text NOT NULL,
+  prof_key        text NOT NULL DEFAULT 'blacksmith',
+  level_req       int  NOT NULL DEFAULT 1,
+  craft_time_sec  int  NOT NULL DEFAULT 60 CHECK (craft_time_sec > 0),
 
-  output_kind     text not null check (output_kind in ('material','item')),
-  output_code     text not null,
-  output_amount   int  not null default 1 check (output_amount > 0),
+  output_kind     text NOT NULL CHECK (output_kind IN ('material','item')),
+  output_code     text NOT NULL,
+  output_amount   int  NOT NULL DEFAULT 1 CHECK (output_amount > 0),
 
-  type            text not null check (type in ('smelt','forge')),
+  type            text NOT NULL CHECK (type IN ('smelt','forge')),
 
   notes           text,
-  json_data       jsonb not null default '{}'::jsonb,
+  json_data       jsonb NOT NULL DEFAULT '{}'::jsonb,
 
-  created_at      timestamptz not null default now(),
-  updated_at      timestamptz not null default now()
+  created_at      timestamptz NOT NULL DEFAULT now(),
+  updated_at      timestamptz NOT NULL DEFAULT now()
 );
 
-create index if not exists idx_blacksmith_recipes_prof_type_level
-  on blacksmith_recipes(prof_key, type, level_req);
+CREATE INDEX IF NOT EXISTS idx_blacksmith_recipes_prof_type_level
+  ON blacksmith_recipes(prof_key, type, level_req);
 
-create table if not exists blacksmith_recipe_ingredients (
-  id          bigserial primary key,
-  recipe_code text not null references blacksmith_recipes(code) on delete cascade,
 
-  input_kind  text not null check (input_kind in ('item','material')),
-  input_code  text not null,
-  qty         int  not null check (qty > 0),
-  role        text not null default 'main',
-
-  unique(recipe_code, input_kind, input_code, role)
+CREATE TABLE IF NOT EXISTS blacksmith_recipe_ingredients (
+  id          bigserial PRIMARY KEY,
+  recipe_code text NOT NULL REFERENCES blacksmith_recipes(code) ON DELETE CASCADE,
+  input_kind  text NOT NULL CHECK (input_kind IN ('item','material')),
+  input_code  text NOT NULL,
+  qty         int  NOT NULL CHECK (qty > 0),
+  role        text NOT NULL DEFAULT 'main',
+  UNIQUE(recipe_code, input_kind, input_code, role)
 );
 
-create index if not exists idx_blacksmith_ing_recipe
-  on blacksmith_recipe_ingredients(recipe_code);
+CREATE INDEX IF NOT EXISTS idx_blacksmith_ing_recipe
+  ON blacksmith_recipe_ingredients(recipe_code);
+
+
+-- =========================================================
+-- 1.1) (optional) Перенос legacy-даних, якщо є *_old
+--      (робимо через dynamic SQL, щоб не падати, якщо *_old не існує)
+-- =========================================================
+
+DO $$
+BEGIN
+  IF to_regclass('public.blacksmith_recipes_old') IS NOT NULL THEN
+    EXECUTE $$
+      INSERT INTO blacksmith_recipes (
+        code, name, prof_key, level_req, craft_time_sec,
+        output_kind, output_code, output_amount,
+        type, notes, json_data
+      )
+      SELECT
+        r.code,
+        r.name,
+        'blacksmith' AS prof_key,
+        COALESCE(r.level_req, 1) AS level_req,
+        GREATEST(60, COALESCE(r.forge_hits, 60) * 3) AS craft_time_sec,
+        'item' AS output_kind,
+        COALESCE(r.output_item_code, r.code) AS output_code,
+        COALESCE(r.output_amount, 1) AS output_amount,
+        'forge' AS type,
+        NULL AS notes,
+        '{}'::jsonb AS json_data
+      FROM blacksmith_recipes_old r
+      ON CONFLICT (code) DO NOTHING;
+    $$;
+  END IF;
+
+  IF to_regclass('public.blacksmith_recipe_ingredients_old') IS NOT NULL THEN
+    EXECUTE $$
+      INSERT INTO blacksmith_recipe_ingredients (recipe_code, input_kind, input_code, qty, role)
+      SELECT
+        i.recipe_code,
+        'material' AS input_kind,
+        i.material_code AS input_code,
+        COALESCE(i.qty,1) AS qty,
+        COALESCE(i.role,'main') AS role
+      FROM blacksmith_recipe_ingredients_old i
+      ON CONFLICT DO NOTHING;
+    $$;
+  END IF;
+END $$;
+
 
 -- =========================================================
 -- 2) Черга крафту гравця
 -- =========================================================
 
-create table if not exists player_blacksmith_queue (
-  id            bigserial primary key,
-  tg_id         bigint not null,
-  recipe_code   text not null references blacksmith_recipes(code) on delete restrict,
+CREATE TABLE IF NOT EXISTS player_blacksmith_queue (
+  id            bigserial PRIMARY KEY,
+  tg_id         bigint NOT NULL,
+  recipe_code   text NOT NULL REFERENCES blacksmith_recipes(code) ON DELETE RESTRICT,
 
-  status        text not null default 'crafting',
-  started_at    timestamptz not null default now(),
-  finish_at     timestamptz not null,
+  status        text NOT NULL DEFAULT 'crafting',
+  started_at    timestamptz NOT NULL DEFAULT now(),
+  finish_at     timestamptz NOT NULL,
 
-  output_kind   text not null check (output_kind in ('material','item')),
-  output_code   text not null,
-  output_amount int  not null default 1 check (output_amount > 0),
+  output_kind   text NOT NULL CHECK (output_kind IN ('material','item')),
+  output_code   text NOT NULL,
+  output_amount int  NOT NULL DEFAULT 1 CHECK (output_amount > 0),
 
-  meta          jsonb not null default '{}'::jsonb,
+  meta          jsonb NOT NULL DEFAULT '{}'::jsonb,
 
-  created_at    timestamptz not null default now(),
-  updated_at    timestamptz not null default now()
+  created_at    timestamptz NOT NULL DEFAULT now(),
+  updated_at    timestamptz NOT NULL DEFAULT now()
 );
 
-create index if not exists idx_player_blacksmith_queue_tg
-  on player_blacksmith_queue(tg_id);
+CREATE INDEX IF NOT EXISTS idx_player_blacksmith_queue_tg
+  ON player_blacksmith_queue(tg_id);
 
-create index if not exists idx_player_blacksmith_queue_tg_status
-  on player_blacksmith_queue(tg_id, status);
+CREATE INDEX IF NOT EXISTS idx_player_blacksmith_queue_tg_status
+  ON player_blacksmith_queue(tg_id, status);
 
-do $$
-begin
-  if not exists (
-    select 1
-    from information_schema.table_constraints
-    where table_name = 'player_blacksmith_queue'
-      and constraint_name = 'player_blacksmith_queue_status_chk'
-  ) then
-    begin
-      alter table player_blacksmith_queue
-        add constraint player_blacksmith_queue_status_chk
-        check (status in ('crafting','done','collected','cancelled'));
-    exception when others then null;
-    end;
-  end if;
-end $$;
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM information_schema.table_constraints
+    WHERE table_schema='public'
+      AND table_name = 'player_blacksmith_queue'
+      AND constraint_name = 'player_blacksmith_queue_status_chk'
+  ) THEN
+    BEGIN
+      ALTER TABLE player_blacksmith_queue
+        ADD CONSTRAINT player_blacksmith_queue_status_chk
+        CHECK (status IN ('crafting','done','collected','cancelled'));
+    EXCEPTION WHEN OTHERS THEN
+      NULL;
+    END;
+  END IF;
+END $$;
+
 
 -- =========================================================
 -- 3) Функція: оновити чергу (crafting -> done якщо час настав)
 -- =========================================================
 
-create or replace function blacksmith_refresh_queue(p_tg_id bigint)
-returns int
-language plpgsql
-as $$
-declare
+CREATE OR REPLACE FUNCTION blacksmith_refresh_queue(p_tg_id bigint)
+RETURNS int
+LANGUAGE plpgsql
+AS $$
+DECLARE
   v_cnt int;
-begin
-  update player_blacksmith_queue
-  set status = 'done',
+BEGIN
+  UPDATE player_blacksmith_queue
+  SET status = 'done',
       updated_at = now()
-  where tg_id = p_tg_id
-    and status = 'crafting'
-    and finish_at <= now();
+  WHERE tg_id = p_tg_id
+    AND status = 'crafting'
+    AND finish_at <= now();
 
-  get diagnostics v_cnt = row_count;
-  return v_cnt;
-end;
+  GET DIAGNOSTICS v_cnt = ROW_COUNT;
+  RETURN v_cnt;
+END;
 $$;
+
 
 -- =========================================================
 -- 4) View для UI: активні задачі ковальства
 -- =========================================================
 
-create or replace view v_player_blacksmith_active as
-select
+CREATE OR REPLACE VIEW v_player_blacksmith_active AS
+SELECT
   q.id,
   q.tg_id,
   q.recipe_code,
-  r.name as recipe_name,
-  r.type as craft_type,
+  r.name AS recipe_name,
+  r.type AS craft_type,
   q.status,
   q.started_at,
   q.finish_at,
-  greatest(0, extract(epoch from (q.finish_at - now()))::int) as seconds_left,
+  GREATEST(0, EXTRACT(EPOCH FROM (q.finish_at - now()))::int) AS seconds_left,
   q.output_kind,
   q.output_code,
   q.output_amount,
   q.meta
-from player_blacksmith_queue q
-join blacksmith_recipes r on r.code = q.recipe_code
-where q.status in ('crafting','done');
+FROM player_blacksmith_queue q
+JOIN blacksmith_recipes r ON r.code = q.recipe_code
+WHERE q.status IN ('crafting','done');
 
-commit;
+COMMIT;
