@@ -70,7 +70,7 @@ async def give_item_to_player_repo(
                 category,
                 emoji,
                 rarity,
-                slot_norm,  # для стекових можна None; для екіпу бажано передавати, але ми ще перевіримо нижче
+                slot_norm,  # для стекових може бути None; для екіпу бажано мати slot
                 stats_json,
                 stack_flag,
                 description,
@@ -88,9 +88,8 @@ async def give_item_to_player_repo(
         item_slot = normalize_slot(item_row["slot"])  # canonical slot з items
         stack = bool(item_row["stackable"]) if "stackable" in item_row else stackable(category)
 
-        # ✅ Стек дозволяємо ТІЛЬКИ якщо предмет stackable і В items.slot НЕ заданий (тобто це НЕ екіп)
+        # ✅ Стек дозволяємо ТІЛЬКИ якщо предмет stackable і в items.slot НЕ заданий (тобто це НЕ екіп)
         if stack and item_slot is None:
-            # Тримаємо всі стеки в slot=NULL (не екіп)
             try:
                 await conn.execute(
                     """
@@ -122,7 +121,6 @@ async def give_item_to_player_repo(
                     item_id,
                     final_qty,
                 )
-                # asyncpg повертає рядок типу "UPDATE 0"
                 if isinstance(updated, str) and updated.endswith(" 0"):
                     await conn.execute(
                         """
@@ -136,7 +134,7 @@ async def give_item_to_player_repo(
                 return
 
         # ✅ Не-стек (екіп або інші штучні екземпляри):
-        # slot НІКОЛИ не NULL. Беремо items.slot, інакше (fallback) slot_norm.
+        # slot НІКОЛИ не NULL. Беремо items.slot, інакше fallback slot_norm.
         final_slot = item_slot or slot_norm
         if not final_slot:
             raise HTTPException(400, "ITEM_HAS_NO_SLOT")
@@ -188,7 +186,7 @@ async def equip_repo(inv_id: int, tg_id: int) -> None:
             if not slot:
                 raise HTTPException(400, "ITEM_HAS_NO_SLOT")
 
-            # ✅ лочимо поточний екіп у слоті
+            # ✅ лочимо поточний екіп у слоті (для чистого swap)
             await conn.execute(
                 """
                 SELECT 1
@@ -218,7 +216,6 @@ async def equip_repo(inv_id: int, tg_id: int) -> None:
             )
 
             # 2) екіпуємо обраний предмет
-            # slot фіксуємо як canonical items.slot
             await conn.execute(
                 """
                 UPDATE player_inventory
