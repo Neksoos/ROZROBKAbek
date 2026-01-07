@@ -6,7 +6,6 @@ from typing import Any, Dict, Optional
 from fastapi import HTTPException
 
 from db import get_pool
-
 from services.inventory.migrations import (
     ensure_items_columns,
     ensure_player_inventory_columns,
@@ -29,6 +28,11 @@ async def give_item_to_player_repo(
     amount: Optional[int] = None,
     slot: Optional[str] = None,
 ) -> None:
+    """
+    Правило:
+    - Стекові (stackable=True і items.slot IS NULL) -> один рядок, slot=NULL, qty=N
+    - Екіп/не-стек -> кожен екземпляр окремим рядком, slot=items.slot (НЕ NULL), qty=1
+    """
     final_qty = qty if qty is not None else (amount if amount is not None else 1)
     try:
         final_qty = int(final_qty)
@@ -66,11 +70,12 @@ async def give_item_to_player_repo(
                 category,
                 emoji,
                 rarity,
-                slot_norm,
+                slot_norm,  # для стекових можна None; для екіпу бажано передавати, але ми ще перевіримо нижче
                 stats_json,
                 stack_flag,
                 description,
             )
+
             item_row = await conn.fetchrow(
                 "SELECT id, stackable, slot, category FROM items WHERE code = $1",
                 item_code,
@@ -80,10 +85,12 @@ async def give_item_to_player_repo(
             raise HTTPException(500, "ITEM_CREATE_FAILED")
 
         item_id = int(item_row["id"])
+        item_slot = normalize_slot(item_row["slot"])  # canonical slot з items
         stack = bool(item_row["stackable"]) if "stackable" in item_row else stackable(category)
 
-        # stack тільки для НЕ-екіпу (player_inventory.slot NULL)
-        if stack and slot_norm is None:
+        # ✅ Стек дозволяємо ТІЛЬКИ якщо предмет stackable і В items.slot НЕ заданий (тобто це НЕ екіп)
+        if stack and item_slot is None:
+            # Тримаємо всі стеки в slot=NULL (не екіп)
             try:
                 await conn.execute(
                     """
@@ -115,6 +122,7 @@ async def give_item_to_player_repo(
                     item_id,
                     final_qty,
                 )
+                # asyncpg повертає рядок типу "UPDATE 0"
                 if isinstance(updated, str) and updated.endswith(" 0"):
                     await conn.execute(
                         """
@@ -127,7 +135,12 @@ async def give_item_to_player_repo(
                     )
                 return
 
-        # не стек / або екземпляри екіпа -> окремими рядками
+        # ✅ Не-стек (екіп або інші штучні екземпляри):
+        # slot НІКОЛИ не NULL. Беремо items.slot, інакше (fallback) slot_norm.
+        final_slot = item_slot or slot_norm
+        if not final_slot:
+            raise HTTPException(400, "ITEM_HAS_NO_SLOT")
+
         for _ in range(final_qty):
             await conn.execute(
                 """
@@ -136,7 +149,7 @@ async def give_item_to_player_repo(
                 """,
                 tg_id,
                 item_id,
-                slot_norm,
+                final_slot,
             )
 
 
@@ -152,7 +165,9 @@ async def equip_repo(inv_id: int, tg_id: int) -> None:
                 SELECT
                   pi.id AS inv_id,
                   pi.tg_id,
+                  COALESCE(pi.qty,1) AS qty,
                   pi.is_equipped,
+                  pi.slot AS inv_slot,
                   i.slot AS item_slot
                 FROM player_inventory pi
                 JOIN items i ON i.id = pi.item_id
@@ -165,26 +180,30 @@ async def equip_repo(inv_id: int, tg_id: int) -> None:
             if not row:
                 raise HTTPException(404, "ITEM_NOT_FOUND")
 
+            # ✅ не даємо екіпати стек
+            if int(row["qty"] or 1) != 1:
+                raise HTTPException(400, "CANNOT_EQUIP_STACK")
+
             slot = normalize_slot(row["item_slot"])
             if not slot:
                 raise HTTPException(400, "ITEM_HAS_NO_SLOT")
 
-            # Лочимо поточний екіп цього слоту, якщо є
+            # ✅ лочимо поточний екіп у слоті
             await conn.execute(
                 """
                 SELECT 1
-                FROM player_inventory pi
-                WHERE pi.tg_id = $1
-                  AND pi.slot = $2
-                  AND pi.is_equipped = TRUE
+                FROM player_inventory
+                WHERE tg_id = $1
+                  AND slot = $2
+                  AND is_equipped = TRUE
                 FOR UPDATE
                 """,
                 tg_id,
                 slot,
             )
 
-            # 1) знімаємо все з цього слоту
-            # ⚠️ НЕ СТАВИМО slot=NULL — інакше екземпляр екіпу перетвориться на "стек"
+            # 1) знімаємо поточний екіп зі слоту
+            # ⚠️ НЕ ставимо slot=NULL
             await conn.execute(
                 """
                 UPDATE player_inventory
@@ -198,8 +217,8 @@ async def equip_repo(inv_id: int, tg_id: int) -> None:
                 slot,
             )
 
-            # 2) екіпуємо цей предмет
-            # slot ставимо (або лишаємо) як слот предмета
+            # 2) екіпуємо обраний предмет
+            # slot фіксуємо як canonical items.slot
             await conn.execute(
                 """
                 UPDATE player_inventory
@@ -220,7 +239,7 @@ async def unequip_repo(inv_id: int, tg_id: int) -> None:
 
     pool = await get_pool()
     async with pool.acquire() as conn:
-        # ⚠️ НЕ СТАВИМО slot=NULL — інакше екземпляр екіпу перетвориться на "стек"
+        # ⚠️ НЕ ставимо slot=NULL
         await conn.execute(
             """
             UPDATE player_inventory
@@ -243,7 +262,7 @@ async def unequip_slot_repo(slot: str, tg_id: int) -> None:
 
     pool = await get_pool()
     async with pool.acquire() as conn:
-        # ⚠️ НЕ СТАВИМО slot=NULL — інакше екземпляр екіпу перетвориться на "стек"
+        # ⚠️ НЕ ставимо slot=NULL
         await conn.execute(
             """
             UPDATE player_inventory
@@ -371,7 +390,7 @@ async def consume_repo(inv_id: int, tg_id: int, want_qty: int) -> Dict[str, int]
         if bool(row["is_equipped"]):
             raise HTTPException(400, "ITEM_NOT_USABLE")
 
-        # тільки “стекові” консумки (slot має бути NULL)
+        # ✅ тільки стеки консумок (slot має бути NULL)
         if row["inv_slot"] is not None:
             raise HTTPException(400, "ITEM_NOT_USABLE")
 
