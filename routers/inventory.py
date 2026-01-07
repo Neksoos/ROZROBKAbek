@@ -1,4 +1,3 @@
-# routers/inventory.py
 from __future__ import annotations
 
 from fastapi import APIRouter, Query
@@ -10,7 +9,10 @@ from services.inventory.models import (
     InventoryListResponse,
     UnequipSlotRequest,
 )
+
+# ✅ ВАЖЛИВО: re-export для сумісності зі старими імпортами
 from services.inventory.service import (
+    give_item_to_player,  # <-- додали
     consume,
     equip,
     get_item,
