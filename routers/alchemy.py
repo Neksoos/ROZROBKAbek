@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from db import get_pool
-from services.inventory.service import give_item_to_player  # ✅ FIX: правильний імпорт
+from services.inventory.service import give_item_to_player  # ✅ правильний імпорт
 
 router = APIRouter(prefix="/api/alchemy", tags=["alchemy"])
 
@@ -96,7 +96,7 @@ class DryingSlotDTO(BaseModel):
     started_at: Optional[datetime] = None
     finish_at: Optional[datetime] = None
     seconds_left: int = 0
-    status: str = "empty"  # "empty" | "drying" | "done"
+    status: str = "empty"  # empty | drying | done
 
 
 class DryingStartRequest(BaseModel):
@@ -117,7 +117,7 @@ def _seconds_left(finish_at: datetime) -> int:
     return max(0, int((finish_at - now).total_seconds()))
 
 
-async def _ensure_queue_columns():
+async def _ensure_queue_columns() -> None:
     pool = await get_pool()
     async with pool.acquire() as conn:
         await conn.execute(
@@ -128,7 +128,7 @@ async def _ensure_queue_columns():
         )
 
 
-async def _ensure_drying_table():
+async def _ensure_drying_table() -> None:
     pool = await get_pool()
     async with pool.acquire() as conn:
         await conn.execute(
@@ -172,7 +172,7 @@ async def _material_code_to_id(conn, material_code: str) -> Optional[int]:
 
 async def _material_code_to_id_map(conn) -> Dict[str, int]:
     rows = await conn.fetch("SELECT id, code FROM craft_materials")
-    return {r["code"]: int(r["id"]) for r in rows}
+    return {str(r["code"]): int(r["id"]) for r in rows}
 
 
 async def _player_materials_map(conn, tg_id: int) -> Dict[int, int]:
@@ -216,6 +216,7 @@ def _calc_missing_for_recipe(
                     role=ing.role,
                 )
             )
+
     return (len(missing) == 0), missing
 
 
@@ -238,24 +239,24 @@ async def _load_all_recipes_with_ingredients(conn) -> List[RecipeDTO]:
 
     by_recipe: Dict[str, List[IngredientDTO]] = {}
     for x in ing:
-        by_recipe.setdefault(x["recipe_code"], []).append(
+        by_recipe.setdefault(str(x["recipe_code"]), []).append(
             IngredientDTO(
-                material_code=x["material_code"],
+                material_code=str(x["material_code"]),
                 qty=int(x["qty"]),
-                role=x["role"],
+                role=str(x["role"]),
             )
         )
 
     return [
         RecipeDTO(
-            code=r["code"],
-            name=r["name"],
-            prof_key=r["prof_key"],
-            level_req=int(r["level_req"]),
-            brew_time_sec=int(r["brew_time_sec"]),
-            output_item_code=r["output_item_code"],
-            output_amount=int(r["output_amount"]),
-            ingredients=by_recipe.get(r["code"], []),
+            code=str(r["code"]),
+            name=str(r["name"]),
+            prof_key=str(r["prof_key"]),
+            level_req=int(r["level_req"] or 1),
+            brew_time_sec=int(r["brew_time_sec"] or 0),
+            output_item_code=str(r["output_item_code"]),
+            output_amount=int(r["output_amount"] or 1),
+            ingredients=by_recipe.get(str(r["code"]), []),
         )
         for r in rows
     ]
@@ -286,24 +287,25 @@ async def _load_recipe_row(conn, recipe_code: str) -> dict:
     return {"recipe": dict(r), "ingredients": [dict(x) for x in ing]}
 
 
-async def _check_and_consume_materials(conn, tg_id: int, ingredients: List[dict]):
+async def _check_and_consume_materials(conn, tg_id: int, ingredients: List[dict]) -> None:
     resolved = []
     for it in ingredients:
         mid = await _material_code_to_id(conn, it["material_code"])
         if not mid:
             raise HTTPException(400, f"MATERIAL_NOT_FOUND:{it['material_code']}")
-        resolved.append((mid, it["material_code"], int(it["qty"]), it["role"]))
+        resolved.append((mid, str(it["material_code"]), int(it["qty"]), str(it.get("role") or "")))
 
+    # precheck
     for mid, mcode, need_qty, _role in resolved:
         row = await conn.fetchrow(
             "SELECT qty FROM player_materials WHERE tg_id=$1 AND material_id=$2",
-            tg_id,
-            mid,
+            tg_id, mid
         )
         have = int(row["qty"]) if row else 0
         if have < need_qty:
             raise HTTPException(400, f"NOT_ENOUGH_MATERIAL:{mcode}:{have}/{need_qty}")
 
+    # deduct
     for mid, _mcode, need_qty, _role in resolved:
         await conn.execute(
             """
@@ -311,23 +313,20 @@ async def _check_and_consume_materials(conn, tg_id: int, ingredients: List[dict]
             SET qty = qty - $3, updated_at = now()
             WHERE tg_id=$1 AND material_id=$2
             """,
-            tg_id,
-            mid,
-            need_qty,
+            tg_id, mid, need_qty
         )
         await conn.execute(
             "DELETE FROM player_materials WHERE tg_id=$1 AND material_id=$2 AND qty <= 0",
-            tg_id,
-            mid,
+            tg_id, mid
         )
 
 
-# ✅ інвентар тут працює через player_inventory.qty (а не amount)
-async def _consume_inventory_item(conn, tg_id: int, item_code: str, amount: int):
+# ✅ НОВЕ: списання інвентаря (під твою схему qty + багато рядків)
+async def _deduct_inventory_item_by_code(conn, tg_id: int, item_code: str, amount: int) -> None:
     if amount <= 0:
         return
 
-    item_id = await _item_code_to_id(conn, item_code)
+    item_id = await conn.fetchval("SELECT id FROM items WHERE code=$1", item_code)
     if not item_id:
         raise HTTPException(404, "ITEM_NOT_FOUND")
 
@@ -374,26 +373,6 @@ async def _consume_inventory_item(conn, tg_id: int, item_code: str, amount: int)
         raise HTTPException(500, "INVENTORY_DEDUCT_FAILED")
 
 
-async def _add_inventory_item(conn, tg_id: int, item_code: str, amount: int):
-    if amount <= 0:
-        return
-
-    item_id = await _item_code_to_id(conn, item_code)
-    if not item_id:
-        raise HTTPException(404, "ITEM_NOT_FOUND")
-
-    # надійно: просто додаємо рядок (не залежить від partial unique index)
-    await conn.execute(
-        """
-        INSERT INTO player_inventory(tg_id, item_id, qty, is_equipped, slot, created_at, updated_at)
-        VALUES ($1,$2,$3,FALSE,NULL,NOW(),NOW())
-        """,
-        tg_id,
-        int(item_id),
-        int(amount),
-    )
-
-
 # ─────────────────────────────────────────────
 # recipes / queue / brew / claim
 # ─────────────────────────────────────────────
@@ -438,7 +417,7 @@ async def get_queue(tg_id: int = Query(..., gt=0)):
     out: List[QueueDTO] = []
     for r in rows:
         sec = _seconds_left(r["finish_at"])
-        status = r["status"]
+        status = str(r["status"])
         if sec <= 0 and status == "brewing":
             status = "done"
 
@@ -446,7 +425,7 @@ async def get_queue(tg_id: int = Query(..., gt=0)):
             QueueDTO(
                 id=int(r["id"]),
                 tg_id=int(r["tg_id"]),
-                recipe_code=r["recipe_code"],
+                recipe_code=str(r["recipe_code"]),
                 status=status,
                 started_at=r["started_at"],
                 finish_at=r["finish_at"],
@@ -469,7 +448,7 @@ async def brew(req: BrewRequest):
         ingredients = data["ingredients"]
 
         now = datetime.now(timezone.utc)
-        finish = now + timedelta(seconds=int(recipe["brew_time_sec"]))
+        finish = now + timedelta(seconds=int(recipe["brew_time_sec"] or 0))
 
         async with conn.transaction():
             await _check_and_consume_materials(conn, req.tg_id, ingredients)
@@ -487,19 +466,19 @@ async def brew(req: BrewRequest):
                 now,
                 finish,
                 recipe["output_item_code"],
-                int(recipe["output_amount"]),
+                int(recipe["output_amount"] or 1),
             )
 
     sec = _seconds_left(row["finish_at"])
     return BrewResponse(
         queue_id=int(row["id"]),
-        recipe_code=row["recipe_code"],
-        status=row["status"],
+        recipe_code=str(row["recipe_code"]),
+        status=str(row["status"]),
         started_at=row["started_at"],
         finish_at=row["finish_at"],
         seconds_left=sec,
-        output_item_code=row["output_item_code"],
-        output_amount=int(row["output_amount"]),
+        output_item_code=str(row["output_item_code"]),
+        output_amount=int(row["output_amount"] or 1),
     )
 
 
@@ -515,8 +494,7 @@ async def claim(queue_id: int, tg_id: int = Query(..., gt=0)):
             FROM player_alchemy_queue
             WHERE id=$1 AND tg_id=$2
             """,
-            queue_id,
-            tg_id,
+            queue_id, tg_id
         )
         if not q:
             raise HTTPException(404, "QUEUE_NOT_FOUND")
@@ -532,12 +510,11 @@ async def claim(queue_id: int, tg_id: int = Query(..., gt=0)):
             raise HTTPException(400, f"OUTPUT_ITEM_NOT_FOUND:{q['output_item_code']}")
 
         async with conn.transaction():
-            # ✅ FIX: give_item_to_player приймає тільки kwargs (tg_id має бути keyword)
-            # ✅ FIX: використовуємо qty (не amount), але response лишаємо як було
+            # ✅ FIX: tg_id тільки keyword
             await give_item_to_player(
                 tg_id=tg_id,
-                item_code=item["code"],
-                name=item["name"],
+                item_code=str(item["code"]),
+                name=str(item["name"]),
                 category=item["category"],
                 emoji=item["emoji"],
                 rarity=item["rarity"],
@@ -549,11 +526,10 @@ async def claim(queue_id: int, tg_id: int = Query(..., gt=0)):
 
             await conn.execute(
                 "DELETE FROM player_alchemy_queue WHERE id=$1 AND tg_id=$2",
-                queue_id,
-                tg_id,
+                queue_id, tg_id
             )
 
-    return {"ok": True, "item_code": item["code"], "amount": int(q["output_amount"] or 1)}
+    return {"ok": True, "item_code": str(item["code"]), "amount": int(q["output_amount"] or 1)}
 
 
 # ─────────────────────────────────────────────
@@ -563,8 +539,8 @@ async def claim(queue_id: int, tg_id: int = Query(..., gt=0)):
 @router.get("/herbs", response_model=List[HerbInvDTO])
 async def list_player_herbs(tg_id: int = Query(..., gt=0)):
     """
-    ✅ Беремо трави за category з таблиці items.
-    ✅ Інвентар: player_inventory має item_id і qty.
+    ✅ items.category починається з herb_
+    ✅ інвентар: player_inventory.qty (а не amount)
     """
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -575,13 +551,14 @@ async def list_player_herbs(tg_id: int = Query(..., gt=0)):
               i.name     AS name,
               i.emoji    AS emoji,
               i.category AS category,
-              pi.qty     AS amount
+              COALESCE(SUM(pi.qty), 0)::int AS amount
             FROM player_inventory pi
             JOIN items i ON i.id = pi.item_id
             WHERE pi.tg_id = $1
+              AND pi.is_equipped = FALSE
               AND i.category LIKE 'herb_%'
               AND pi.qty > 0
-              AND pi.is_equipped = FALSE
+            GROUP BY i.code, i.name, i.emoji, i.category
             ORDER BY i.category, i.name
             """,
             tg_id,
@@ -589,11 +566,11 @@ async def list_player_herbs(tg_id: int = Query(..., gt=0)):
 
     return [
         HerbInvDTO(
-            item_code=r["item_code"],
-            name=r["name"],
+            item_code=str(r["item_code"]),
+            name=str(r["name"]),
             emoji=r["emoji"],
-            category=r["category"],
-            amount=int(r["amount"]),
+            category=str(r["category"]),
+            amount=int(r["amount"] or 0),
         )
         for r in rows
     ]
@@ -602,18 +579,17 @@ async def list_player_herbs(tg_id: int = Query(..., gt=0)):
 @router.get("/drying", response_model=List[DryingSlotDTO])
 async def get_drying(tg_id: int = Query(..., gt=0)):
     await _ensure_drying_table()
-
     pool = await get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
-            SELECT tg_id, slot_index, input_item_code, input_amount, output_material_code, output_amount,
-                   status, started_at, finish_at
+            SELECT tg_id, slot_index, input_item_code, input_amount,
+                   output_material_code, output_amount, status, started_at, finish_at
             FROM player_alchemy_drying
             WHERE tg_id=$1
             ORDER BY slot_index ASC
             """,
-            tg_id,
+            tg_id
         )
 
     by_slot: Dict[int, dict] = {int(r["slot_index"]): dict(r) for r in rows}
@@ -626,18 +602,18 @@ async def get_drying(tg_id: int = Query(..., gt=0)):
             continue
 
         sec = _seconds_left(r["finish_at"])
-        status = r["status"]
+        status = str(r["status"])
         if sec <= 0 and status == "drying":
             status = "done"
 
         out.append(
             DryingSlotDTO(
-                slot_index=slot,
+                slot_index=int(r["slot_index"]),
                 tg_id=int(r["tg_id"]),
-                input_item_code=r["input_item_code"],
-                input_amount=int(r["input_amount"]),
-                output_material_code=r["output_material_code"],
-                output_amount=int(r["output_amount"]),
+                input_item_code=str(r["input_item_code"]),
+                input_amount=int(r["input_amount"] or 0),
+                output_material_code=str(r["output_material_code"]),
+                output_amount=int(r["output_amount"] or 0),
                 started_at=r["started_at"],
                 finish_at=r["finish_at"],
                 seconds_left=sec,
@@ -656,18 +632,16 @@ async def start_drying(req: DryingStartRequest):
     async with pool.acquire() as conn:
         item = await conn.fetchrow(
             "SELECT code, category FROM items WHERE code=$1",
-            req.item_code,
+            req.item_code
         )
         if not item:
             raise HTTPException(404, "ITEM_NOT_FOUND")
 
-        # ✅ “трави” визначаємо по category
         if not str(item["category"]).startswith("herb_"):
             raise HTTPException(400, "ONLY_HERBS_ALLOWED")
 
         out_code = _map_herb_item_to_dried_material(req.item_code)
 
-        # craft material має існувати
         mid = await _material_code_to_id(conn, out_code)
         if not mid:
             raise HTTPException(400, f"DRIED_MATERIAL_NOT_FOUND:{out_code}")
@@ -678,14 +652,13 @@ async def start_drying(req: DryingStartRequest):
         async with conn.transaction():
             existing = await conn.fetchrow(
                 "SELECT status FROM player_alchemy_drying WHERE tg_id=$1 AND slot_index=$2",
-                req.tg_id,
-                req.slot_index,
+                req.tg_id, req.slot_index
             )
             if existing and str(existing["status"]) in ("drying", "done"):
                 raise HTTPException(400, "SLOT_ALREADY_USED")
 
-            # ✅ списання з інвентарю (qty)
-            await _consume_inventory_item(conn, req.tg_id, req.item_code, int(req.amount))
+            # ✅ списання з інвентаря під твою схему (qty + багато рядків)
+            await _deduct_inventory_item_by_code(conn, req.tg_id, req.item_code, int(req.amount))
 
             row = await conn.fetchrow(
                 """
@@ -705,27 +678,23 @@ async def start_drying(req: DryingStartRequest):
                     started_at=EXCLUDED.started_at,
                     finish_at=EXCLUDED.finish_at,
                     updated_at=now()
-                RETURNING tg_id, slot_index, input_item_code, input_amount, output_material_code, output_amount,
+                RETURNING tg_id, slot_index, input_item_code, input_amount,
+                          output_material_code, output_amount,
                           status, started_at, finish_at
                 """,
-                req.tg_id,
-                req.slot_index,
-                req.item_code,
-                int(req.amount),
-                out_code,
-                int(req.amount),
-                now,
-                finish,
+                req.tg_id, req.slot_index, req.item_code, int(req.amount),
+                out_code, int(req.amount),
+                now, finish
             )
 
     sec = _seconds_left(row["finish_at"])
     return DryingSlotDTO(
         slot_index=int(row["slot_index"]),
         tg_id=int(row["tg_id"]),
-        input_item_code=row["input_item_code"],
-        input_amount=int(row["input_amount"]),
-        output_material_code=row["output_material_code"],
-        output_amount=int(row["output_amount"]),
+        input_item_code=str(row["input_item_code"]),
+        input_amount=int(row["input_amount"] or 0),
+        output_material_code=str(row["output_material_code"]),
+        output_amount=int(row["output_amount"] or 0),
         started_at=row["started_at"],
         finish_at=row["finish_at"],
         seconds_left=sec,
@@ -748,8 +717,7 @@ async def claim_drying(slot_index: int, tg_id: int = Query(..., gt=0)):
             FROM player_alchemy_drying
             WHERE tg_id=$1 AND slot_index=$2
             """,
-            tg_id,
-            slot_index,
+            tg_id, slot_index
         )
         if not row:
             raise HTTPException(404, "SLOT_EMPTY")
@@ -761,22 +729,25 @@ async def claim_drying(slot_index: int, tg_id: int = Query(..., gt=0)):
             await conn.execute(
                 """
                 INSERT INTO player_materials(tg_id, material_id, qty, created_at, updated_at)
-                VALUES ($1,$2,$3, now(), now())
+                VALUES ($1, (SELECT id FROM craft_materials WHERE code=$2), $3, now(), now())
                 ON CONFLICT (tg_id, material_id)
                 DO UPDATE SET qty = player_materials.qty + EXCLUDED.qty, updated_at = now()
                 """,
-                int(row["tg_id"]),
-                int(await _material_code_to_id(conn, row["output_material_code"])),
-                int(row["output_amount"]),
+                tg_id,
+                str(row["output_material_code"]),
+                int(row["output_amount"] or 1),
             )
 
             await conn.execute(
                 "DELETE FROM player_alchemy_drying WHERE tg_id=$1 AND slot_index=$2",
-                tg_id,
-                slot_index,
+                tg_id, slot_index
             )
 
-    return {"ok": True, "material_code": row["output_material_code"], "qty": int(row["output_amount"])}
+    return {
+        "ok": True,
+        "material_code": str(row["output_material_code"]),
+        "qty": int(row["output_amount"] or 1),
+    }
 
 
 @router.post("/drying/cancel/{slot_index}")
@@ -794,25 +765,37 @@ async def cancel_drying(slot_index: int, tg_id: int = Query(..., gt=0)):
             FROM player_alchemy_drying
             WHERE tg_id=$1 AND slot_index=$2
             """,
-            tg_id,
-            slot_index,
+            tg_id, slot_index
         )
         if not row:
             raise HTTPException(404, "SLOT_EMPTY")
 
-        async with conn.transaction():
-            # ✅ повернення в інвентар (qty)
-            await _add_inventory_item(
-                conn,
-                tg_id=int(row["tg_id"]),
-                item_code=row["input_item_code"],
-                amount=int(row["input_amount"]),
-            )
+        # беремо мету предмета, щоб коректно повернути в інвентар
+        item = await conn.fetchrow(
+            "SELECT code, name, category, emoji, rarity, description, stats, slot FROM items WHERE code=$1",
+            str(row["input_item_code"]),
+        )
+        if not item:
+            raise HTTPException(400, f"ITEM_META_NOT_FOUND:{row['input_item_code']}")
 
+        async with conn.transaction():
             await conn.execute(
                 "DELETE FROM player_alchemy_drying WHERE tg_id=$1 AND slot_index=$2",
-                tg_id,
-                slot_index,
+                tg_id, slot_index
             )
+
+    # ✅ повернення в інвентар після транзакції
+    await give_item_to_player(
+        tg_id=tg_id,
+        item_code=str(item["code"]),
+        name=str(item["name"]),
+        category=item["category"],
+        emoji=item["emoji"],
+        rarity=item["rarity"],
+        description=item["description"],
+        stats=item["stats"] if isinstance(item["stats"], dict) else None,
+        qty=int(row["input_amount"] or 1),
+        slot=item["slot"],
+    )
 
     return {"ok": True}
