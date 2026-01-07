@@ -22,7 +22,7 @@ async def ensure_items_columns() -> None:
         await conn.execute("""ALTER TABLE items ADD COLUMN IF NOT EXISTS mp INTEGER DEFAULT 0;""")
         await conn.execute("""ALTER TABLE items ADD COLUMN IF NOT EXISTS weight INTEGER DEFAULT 0;""")
 
-        # best-effort міграції/чистка
+        # best-effort чистка
         await conn.execute("""UPDATE items SET sell_price = 1 WHERE sell_price IS NULL;""")
         await conn.execute(
             """
@@ -65,14 +65,11 @@ async def ensure_player_inventory_columns() -> None:
             END $$;
             """
         )
+
         await conn.execute("""UPDATE player_inventory SET qty = 1 WHERE qty IS NULL OR qty = 0;""")
         await conn.execute("""UPDATE player_inventory SET is_equipped = FALSE WHERE is_equipped IS NULL;""")
 
-        # ─────────────────────────────────────────────
-        # ВАЖЛИВО:
-        # 1) Прибрати legacy UNIQUE (tg_id,item_id), бо він заважає мати 2 однакові екземпляри екіпу.
-        #    Нам потрібен UNIQUE тільки для стеків: slot IS NULL AND is_equipped=FALSE.
-        # ─────────────────────────────────────────────
+        # 1) прибрати legacy UNIQUE (tg_id,item_id) якщо існує (constraint або non-partial unique index)
         await conn.execute(
             """
             DO $$
@@ -80,7 +77,6 @@ async def ensure_player_inventory_columns() -> None:
               c_name text;
               i_name text;
             BEGIN
-              -- 1) drop constraint типу UNIQUE(tg_id,item_id), якщо він існує
               SELECT conname INTO c_name
               FROM pg_constraint
               WHERE conrelid = 'player_inventory'::regclass
@@ -92,7 +88,6 @@ async def ensure_player_inventory_columns() -> None:
                 EXECUTE format('ALTER TABLE player_inventory DROP CONSTRAINT %I', c_name);
               END IF;
 
-              -- 2) drop unique index (НЕ partial), якщо хтось колись робив UNIQUE INDEX на (tg_id,item_id)
               SELECT indexname INTO i_name
               FROM pg_indexes
               WHERE schemaname = current_schema()
@@ -109,7 +104,23 @@ async def ensure_player_inventory_columns() -> None:
             """
         )
 
-        # 3) partial unique index для стеків (tg_id,item_id) коли slot NULL і не екіп
+        # 2) ✅ ВАЖЛИВО: спочатку підчистити "биті" екземпляри екіпу, які колись стали slot=NULL
+        #    (щоб створення partial-unique для стеків не падало)
+        await conn.execute(
+            """
+            UPDATE player_inventory pi
+            SET slot = i.slot,
+                updated_at = NOW()
+            FROM items i
+            WHERE i.id = pi.item_id
+              AND pi.slot IS NULL
+              AND COALESCE(i.slot,'') <> ''
+              AND COALESCE(pi.is_equipped, FALSE) = FALSE;
+            """
+        )
+
+        # 3) partial unique index для стеків:
+        #    дозволяє 1 рядок на (tg_id,item_id) тільки коли slot NULL і не екіп
         await conn.execute(
             """
             DO $$
@@ -130,19 +141,24 @@ async def ensure_player_inventory_columns() -> None:
             """
         )
 
-        # 4) (Опційно, але дуже корисно) підчистити "битий" екіп,
-        # який колись став slot=NULL через стару логіку unequip/equip.
-        # Це не робить їх стекабельними — просто повертає slot з items.slot.
+        # 4) (супер корисно) гарантує, що в одному слоті може бути лише 1 екіп (на гравця)
         await conn.execute(
             """
-            UPDATE player_inventory pi
-            SET slot = i.slot,
-                updated_at = NOW()
-            FROM items i
-            WHERE i.id = pi.item_id
-              AND pi.slot IS NULL
-              AND COALESCE(i.slot,'') <> ''
-              AND COALESCE(pi.is_equipped, FALSE) = FALSE;
+            DO $$
+            BEGIN
+              IF NOT EXISTS (
+                SELECT 1
+                FROM pg_indexes
+                WHERE schemaname = current_schema()
+                  AND indexname = 'uq_player_equipped_slot'
+              ) THEN
+                EXECUTE '
+                  CREATE UNIQUE INDEX uq_player_equipped_slot
+                  ON player_inventory (tg_id, slot)
+                  WHERE is_equipped = TRUE
+                ';
+              END IF;
+            END $$;
             """
         )
 
