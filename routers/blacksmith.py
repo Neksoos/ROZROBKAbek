@@ -1,3 +1,4 @@
+# routers/blacksmith.py
 from __future__ import annotations
 
 from datetime import datetime, timezone
@@ -7,7 +8,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from db import get_pool
-from services.inventory.service import give_item_to_player  # ✅ правильний імпорт
+from services.inventory.service import give_item_to_player  # ✅ FIX: правильний імпорт
 
 router = APIRouter(prefix="/api/blacksmith", tags=["blacksmith"])
 
@@ -17,7 +18,7 @@ router = APIRouter(prefix="/api/blacksmith", tags=["blacksmith"])
 # ─────────────────────────────────────────────
 
 class IngredientDTO(BaseModel):
-    # ⚠️ лишаю назву як було (material_code), але це item_code з items
+    # ⚠️ лишаю назву як було (material_code), але це item_code з таблиці items
     material_code: str
     qty: int
     role: str = "metal"
@@ -116,22 +117,22 @@ async def _ensure_blacksmith_tables() -> None:
         await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS blacksmith_recipes (
-              code                  text PRIMARY KEY,
-              name                  text NOT NULL,
-              slot                  text NOT NULL,
-              level_req             int  NOT NULL DEFAULT 1,
+                code                  text PRIMARY KEY,
+                name                  text NOT NULL,
+                slot                  text NOT NULL,
+                level_req             int  NOT NULL DEFAULT 1,
 
-              forge_hits            int  NOT NULL DEFAULT 60,
-              base_progress_per_hit double precision NOT NULL DEFAULT 0.0166667,
-              heat_sensitivity      double precision NOT NULL DEFAULT 0.65,
-              rhythm_min_ms         int  NOT NULL DEFAULT 120,
-              rhythm_max_ms         int  NOT NULL DEFAULT 220,
+                forge_hits            int  NOT NULL DEFAULT 60,
+                base_progress_per_hit double precision NOT NULL DEFAULT 0.0166667,
+                heat_sensitivity      double precision NOT NULL DEFAULT 0.65,
+                rhythm_min_ms         int  NOT NULL DEFAULT 120,
+                rhythm_max_ms         int  NOT NULL DEFAULT 220,
 
-              output_item_code      text NOT NULL,
-              output_amount         int  NOT NULL DEFAULT 1,
+                output_item_code      text NOT NULL,
+                output_amount         int  NOT NULL DEFAULT 1,
 
-              created_at            timestamptz NOT NULL DEFAULT now(),
-              updated_at            timestamptz NOT NULL DEFAULT now()
+                created_at            timestamptz NOT NULL DEFAULT now(),
+                updated_at            timestamptz NOT NULL DEFAULT now()
             );
             """
         )
@@ -140,11 +141,11 @@ async def _ensure_blacksmith_tables() -> None:
         await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS blacksmith_recipe_ingredients (
-              recipe_code   text NOT NULL REFERENCES blacksmith_recipes(code) ON DELETE CASCADE,
-              material_code text NOT NULL,
-              qty           int  NOT NULL DEFAULT 1,
-              role          text NOT NULL DEFAULT 'metal',
-              PRIMARY KEY (recipe_code, material_code, role)
+                recipe_code   text NOT NULL REFERENCES blacksmith_recipes(code) ON DELETE CASCADE,
+                material_code text NOT NULL,
+                qty           int  NOT NULL DEFAULT 1,
+                role          text NOT NULL DEFAULT 'metal',
+                PRIMARY KEY (recipe_code, material_code, role)
             );
             """
         )
@@ -152,18 +153,18 @@ async def _ensure_blacksmith_tables() -> None:
         await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS player_blacksmith_forge (
-              id                    bigserial PRIMARY KEY,
-              tg_id                 bigint NOT NULL,
-              recipe_code           text NOT NULL REFERENCES blacksmith_recipes(code),
-              status                text NOT NULL DEFAULT 'started', -- started|claimed|cancelled
-              started_at            timestamptz NOT NULL DEFAULT now(),
-              claimed_at            timestamptz NULL,
+                id                    bigserial PRIMARY KEY,
+                tg_id                 bigint NOT NULL,
+                recipe_code           text NOT NULL REFERENCES blacksmith_recipes(code),
+                status                text NOT NULL DEFAULT 'started', -- started|claimed|cancelled
+                started_at            timestamptz NOT NULL DEFAULT now(),
+                claimed_at            timestamptz NULL,
 
-              required_hits         int NOT NULL,
-              base_progress_per_hit double precision NOT NULL,
-              heat_sensitivity      double precision NOT NULL,
-              rhythm_min_ms         int NOT NULL,
-              rhythm_max_ms         int NOT NULL
+                required_hits         int NOT NULL,
+                base_progress_per_hit double precision NOT NULL,
+                heat_sensitivity      double precision NOT NULL,
+                rhythm_min_ms         int NOT NULL,
+                rhythm_max_ms         int NOT NULL
             );
             """
         )
@@ -172,23 +173,23 @@ async def _ensure_blacksmith_tables() -> None:
         await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS blacksmith_smelt_recipes (
-              code             text PRIMARY KEY,
-              name             text NOT NULL,
-              output_item_code text NOT NULL,
-              output_amount    int  NOT NULL DEFAULT 1,
-              created_at       timestamptz NOT NULL DEFAULT now(),
-              updated_at       timestamptz NOT NULL DEFAULT now()
+                code             text PRIMARY KEY,
+                name             text NOT NULL,
+                output_item_code text NOT NULL,
+                output_amount    int  NOT NULL DEFAULT 1,
+                created_at       timestamptz NOT NULL DEFAULT now(),
+                updated_at       timestamptz NOT NULL DEFAULT now()
             );
             """
         )
         await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS blacksmith_smelt_ingredients (
-              recipe_code   text NOT NULL REFERENCES blacksmith_smelt_recipes(code) ON DELETE CASCADE,
-              material_code text NOT NULL, -- item_code
-              qty           int  NOT NULL DEFAULT 1,
-              role          text NOT NULL DEFAULT 'ore',
-              PRIMARY KEY (recipe_code, material_code, role)
+                recipe_code   text NOT NULL REFERENCES blacksmith_smelt_recipes(code) ON DELETE CASCADE,
+                material_code text NOT NULL, -- item_code
+                qty           int  NOT NULL DEFAULT 1,
+                role          text NOT NULL DEFAULT 'ore',
+                PRIMARY KEY (recipe_code, material_code, role)
             );
             """
         )
@@ -199,7 +200,7 @@ async def _ensure_blacksmith_tables() -> None:
 
 
 async def _seed_blacksmith_demo_if_empty() -> None:
-    """Демо-рецепти кування + плавки, щоб сторінка вже працювала."""
+    """Демо-рецепти кування + плавки, щоб сторінка вже працювала. Потім можеш прибрати."""
     pool = await get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow("SELECT count(*) AS c FROM blacksmith_recipes")
@@ -211,7 +212,7 @@ async def _seed_blacksmith_demo_if_empty() -> None:
                 VALUES
                   ('smith_knife_iron_1', 'Залізний ніж ремісника', 'weapon', 1, 45, 1.0/45.0, 0.65, 120, 220, 'knife_iron_01', 1),
                   ('smith_helm_iron_2',  'Клепаний шолом',         'helmet', 2, 80, 1.0/80.0, 0.68, 120, 220, 'helm_iron_01',  1),
-                  ('smith_chest_iron_3', 'Нагрудник із лускою',    'armor',  3, 140, 1.0/140.0,0.72, 120, 220, 'chest_iron_01', 1)
+                  ('smith_chest_iron_3', 'Нагрудник із лускою',    'armor',  3, 140,1.0/140.0,0.72, 120, 220, 'chest_iron_01', 1)
                 ;
                 """
             )
@@ -277,7 +278,8 @@ async def _player_inventory_qty_by_code(conn, tg_id: int) -> Dict[str, int]:
         SELECT i.code AS code, COALESCE(SUM(pi.qty), 0)::int AS qty
         FROM player_inventory pi
         JOIN items i ON i.id = pi.item_id
-        WHERE pi.tg_id = $1 AND pi.is_equipped = FALSE
+        WHERE pi.tg_id = $1
+          AND pi.is_equipped = FALSE
         GROUP BY i.code
         """,
         tg_id,
@@ -317,7 +319,7 @@ async def _deduct_inventory_items(conn, tg_id: int, ingredients: List[Ingredient
             detail={"code": "NOT_ENOUGH_ITEMS", "missing": [m.dict() for m in miss]},
         )
 
-    # списання по item_code: з стеків/рядків по черзі
+    # Списання по кожному item_code: зі старих рядків → нові
     for ing in ingredients:
         code = str(ing.material_code)
         need = int(ing.qty)
@@ -423,13 +425,14 @@ async def _load_smelt_recipes(conn) -> List[SmeltRecipeDTO]:
 
     out: List[SmeltRecipeDTO] = []
     for r in rrows:
+        code = str(r["code"])
         out.append(
             SmeltRecipeDTO(
-                code=str(r["code"]),
+                code=code,
                 name=str(r["name"]),
                 output_item_code=str(r["output_item_code"]),
                 output_amount=int(r["output_amount"] or 1),
-                ingredients=ings_by.get(str(r["code"]), []),
+                ingredients=ings_by.get(code, []),
             )
         )
     return out
@@ -500,7 +503,6 @@ async def smelt_start(tg_id: int, body: SmeltStartBody) -> SmeltStartResponse:
             amount = int(rr["output_amount"] or 1)
             meta = await _get_item_meta(conn, item_code)
 
-    # ✅ FIX: tg_id тільки keyword
     await give_item_to_player(
         tg_id=tg_id,
         item_code=item_code,
@@ -537,6 +539,7 @@ async def _load_forge_recipes(conn) -> List[RecipeDTO]:
         ORDER BY recipe_code, role, material_code
         """
     )
+
     ings_by: Dict[str, List[IngredientDTO]] = {}
     for r in irows:
         code = str(r["recipe_code"])
@@ -559,10 +562,12 @@ async def _load_forge_recipes(conn) -> List[RecipeDTO]:
                 name=str(r["name"]),
                 slot=str(r["slot"]),
                 level_req=int(r["level_req"] or 1),
+
                 forge_hits=hits,
                 base_progress_per_hit=base,
                 heat_sensitivity=float(r["heat_sensitivity"] or 0.65),
                 rhythm_window_ms=(int(r["rhythm_min_ms"] or 120), int(r["rhythm_max_ms"] or 220)),
+
                 output_item_code=str(r["output_item_code"]),
                 output_amount=int(r["output_amount"] or 1),
                 ingredients=ings_by.get(code, []),
@@ -604,7 +609,8 @@ async def forge_start(tg_id: int, body: ForgeStartBody) -> ForgeStartResponse:
         async with conn.transaction():
             r = await conn.fetchrow(
                 """
-                SELECT code, forge_hits, base_progress_per_hit, heat_sensitivity, rhythm_min_ms, rhythm_max_ms
+                SELECT code, forge_hits, base_progress_per_hit, heat_sensitivity,
+                       rhythm_min_ms, rhythm_max_ms
                 FROM blacksmith_recipes
                 WHERE code=$1
                 """,
@@ -714,12 +720,11 @@ async def forge_claim(tg_id: int, body: ForgeClaimBody) -> ForgeClaimResponse:
                 UPDATE player_blacksmith_forge
                    SET status='claimed',
                        claimed_at=now()
-                WHERE id=$1
+                 WHERE id=$1
                 """,
                 body.forge_id,
             )
 
-    # ✅ FIX: tg_id тільки keyword
     await give_item_to_player(
         tg_id=tg_id,
         item_code=item_code,
