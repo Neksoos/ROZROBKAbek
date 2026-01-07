@@ -1,7 +1,7 @@
 # services/inventory/repo.py
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional
 
 from fastapi import HTTPException
 
@@ -184,11 +184,11 @@ async def equip_repo(inv_id: int, tg_id: int) -> None:
             )
 
             # 1) знімаємо все з цього слоту
+            # ⚠️ НЕ СТАВИМО slot=NULL — інакше екземпляр екіпу перетвориться на "стек"
             await conn.execute(
                 """
                 UPDATE player_inventory
                 SET is_equipped = FALSE,
-                    slot = NULL,
                     updated_at = NOW()
                 WHERE tg_id = $1
                   AND slot = $2
@@ -199,6 +199,7 @@ async def equip_repo(inv_id: int, tg_id: int) -> None:
             )
 
             # 2) екіпуємо цей предмет
+            # slot ставимо (або лишаємо) як слот предмета
             await conn.execute(
                 """
                 UPDATE player_inventory
@@ -219,11 +220,11 @@ async def unequip_repo(inv_id: int, tg_id: int) -> None:
 
     pool = await get_pool()
     async with pool.acquire() as conn:
+        # ⚠️ НЕ СТАВИМО slot=NULL — інакше екземпляр екіпу перетвориться на "стек"
         await conn.execute(
             """
             UPDATE player_inventory
             SET is_equipped = FALSE,
-                slot = NULL,
                 updated_at = NOW()
             WHERE id = $1 AND tg_id = $2
             """,
@@ -242,11 +243,11 @@ async def unequip_slot_repo(slot: str, tg_id: int) -> None:
 
     pool = await get_pool()
     async with pool.acquire() as conn:
+        # ⚠️ НЕ СТАВИМО slot=NULL — інакше екземпляр екіпу перетвориться на "стек"
         await conn.execute(
             """
             UPDATE player_inventory
             SET is_equipped = FALSE,
-                slot = NULL,
                 updated_at = NOW()
             WHERE tg_id = $1
               AND slot = $2
@@ -382,7 +383,6 @@ async def consume_repo(inv_id: int, tg_id: int, want_qty: int) -> Dict[str, int]
 
         category = (row["category"] or "").strip().lower()
         stats = row["stats"]
-        # stats нормалізується на рівні service/utils, але тут лишаємо як було: через JSONB воно dict.
         base_stats: Dict[str, Any] = dict(stats or {})
 
         hp_restore = int(base_stats.get("hp", 0) or 0) + int(row["item_hp"] or 0)
