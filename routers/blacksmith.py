@@ -253,76 +253,6 @@ async def _ensure_blacksmith_tables() -> None:
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_bsmith_smelt ON blacksmith_smelt_recipes(code);")
 
 
-async def _seed_blacksmith_demo_if_empty() -> None:
-    """Демо-рецепти кування + плавки, щоб сторінка вже працювала. Потім можеш прибрати."""
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT count(*) AS c FROM blacksmith_recipes")
-        if not row or int(row["c"] or 0) == 0:
-            await conn.execute(
-                """
-                INSERT INTO blacksmith_recipes
-                  (code, name, slot, level_req, forge_hits, base_progress_per_hit, heat_sensitivity, rhythm_min_ms, rhythm_max_ms, output_item_code, output_amount)
-                VALUES
-                  ('smith_knife_iron_1', 'Залізний ніж ремісника', 'weapon', 1, 45, 1.0/45.0, 0.65, 120, 220, 'knife_iron_01', 1),
-                  ('smith_helm_iron_2',  'Клепаний шолом',         'helmet', 2, 80, 1.0/80.0, 0.68, 120, 220, 'helm_iron_01',  1),
-                  -- ✅ FIX: chest -> armor (бо канонічний слот у інвентарі armor)
-                  ('smith_chest_iron_3', 'Нагрудник із лускою',    'armor',  3, 140,1.0/140.0,0.72, 120, 220, 'chest_iron_01', 1)
-                ;
-                """
-            )
-            await conn.execute(
-                """
-                INSERT INTO blacksmith_recipe_ingredients (recipe_code, material_code, qty, role)
-                VALUES
-                  ('smith_knife_iron_1', 'smith_ingot_zalizna', 2, 'metal'),
-                  ('smith_knife_iron_1', 'leather_strip', 1, 'binding'),
-
-                  ('smith_helm_iron_2', 'smith_ingot_zalizna', 4, 'metal'),
-                  ('smith_helm_iron_2', 'rivet_set', 1, 'fasteners'),
-
-                  ('smith_chest_iron_3', 'smith_ingot_zalizna', 8, 'metal'),
-                  ('smith_chest_iron_3', 'leather_strip', 2, 'binding')
-                ;
-                """
-            )
-
-        srow = await conn.fetchrow("SELECT count(*) AS c FROM blacksmith_smelt_recipes")
-        if not srow or int(srow["c"] or 0) == 0:
-            await conn.execute(
-                """
-                INSERT INTO blacksmith_smelt_recipes (code, name, output_item_code, output_amount)
-                VALUES
-                  ('smelt_fuel_1', 'Паливо: ковалівське вугілля', 'smith_fuel_vuhilna_zhyla', 1),
-                  ('smelt_iron_1', 'Плавка: залізний чушок', 'smith_ingot_zalizna', 1),
-                  ('smelt_copper_1', 'Плавка: мідний злиток', 'smith_ingot_midna', 1),
-                  ('smelt_kryt_1', 'Плавка: крицевий злиток', 'smith_ingot_krytcovyi', 1),
-                  ('smelt_silverstone_1', 'Плавка: срібний злиток', 'smith_ingot_sriblokamin', 1)
-                ;
-                """
-            )
-            await conn.execute(
-                """
-                INSERT INTO blacksmith_smelt_ingredients (recipe_code, material_code, qty, role)
-                VALUES
-                  ('smelt_fuel_1', 'ore_vuhilna_zhyla', 2, 'ore'),
-
-                  ('smelt_iron_1', 'ore_ruda_zalizna', 3, 'ore'),
-                  ('smelt_iron_1', 'smith_fuel_vuhilna_zhyla', 1, 'fuel'),
-
-                  ('smelt_copper_1', 'ore_midna_zhyla', 3, 'ore'),
-                  ('smelt_copper_1', 'smith_fuel_vuhilna_zhyla', 1, 'fuel'),
-
-                  ('smelt_kryt_1', 'ore_krytcovyi_kamin', 4, 'ore'),
-                  ('smelt_kryt_1', 'smith_fuel_vuhilna_zhyla', 1, 'fuel'),
-
-                  ('smelt_silverstone_1', 'ore_sriblokamin', 4, 'ore'),
-                  ('smelt_silverstone_1', 'smith_fuel_vuhilna_zhyla', 1, 'fuel')
-                ;
-                """
-            )
-
-
 # ─────────────────────────────────────────────
 # helpers (INVENTORY)
 # ─────────────────────────────────────────────
@@ -518,11 +448,18 @@ async def smelt_recipes_status(tg_id: int) -> List[SmeltStatusDTO]:
         raise HTTPException(400, "INVALID_TG_ID")
 
     await _ensure_blacksmith_tables()
-    await _seed_blacksmith_demo_if_empty()
 
     pool = await get_pool()
     async with pool.acquire() as conn:
         recipes = await _load_smelt_recipes(conn)
+        if not recipes:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "SMELT_RECIPES_NOT_SEEDED",
+                    "hint": "Заповни blacksmith_smelt_recipes та blacksmith_smelt_ingredients (migrations/seed).",
+                },
+            )
         have = await _player_inventory_qty_by_code(conn, tg_id)
 
     out: List[SmeltStatusDTO] = []
@@ -538,7 +475,6 @@ async def smelt_start(tg_id: int, body: SmeltStartBody) -> SmeltStartResponse:
         raise HTTPException(400, "INVALID_TG_ID")
 
     await _ensure_blacksmith_tables()
-    await _seed_blacksmith_demo_if_empty()
 
     item_code: str
     amount: int
@@ -664,11 +600,18 @@ async def recipes_status(tg_id: int) -> List[RecipeStatusDTO]:
         raise HTTPException(400, "INVALID_TG_ID")
 
     await _ensure_blacksmith_tables()
-    await _seed_blacksmith_demo_if_empty()
 
     pool = await get_pool()
     async with pool.acquire() as conn:
         recipes = await _load_forge_recipes(conn)
+        if not recipes:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "RECIPES_NOT_SEEDED",
+                    "hint": "Заповни blacksmith_recipes та blacksmith_recipe_ingredients (migrations/seed).",
+                },
+            )
         have = await _player_inventory_qty_by_code(conn, tg_id)
 
     out: List[RecipeStatusDTO] = []
@@ -684,7 +627,6 @@ async def forge_start(tg_id: int, body: ForgeStartBody) -> ForgeStartResponse:
         raise HTTPException(400, "INVALID_TG_ID")
 
     await _ensure_blacksmith_tables()
-    await _seed_blacksmith_demo_if_empty()
 
     pool = await get_pool()
     async with pool.acquire() as conn:
