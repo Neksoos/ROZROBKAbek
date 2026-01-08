@@ -856,4 +856,3 @@ async def forge_claim(tg_id: int, body: ForgeClaimBody) -> ForgeClaimResponse:
     )
 
     return ForgeClaimResponse(ok=True, item_code=item_code, amount=amount)
-```0
