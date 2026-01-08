@@ -10,11 +10,13 @@ from pydantic import BaseModel, Field
 
 from db import get_pool
 
-# ✅ у цьому репо give_item_to_player + ensure'и живуть у routers/inventory.py
-from routers.inventory import (  # type: ignore
-    give_item_to_player,
-    _ensure_items_columns,
-    _ensure_player_inventory_columns,
+# ✅ після рефакторингу інвентаря:
+# give_item_to_player живе у services.inventory.service
+# ensure'и живуть у services.inventory.migrations
+from services.inventory.service import give_item_to_player  # type: ignore
+from services.inventory.migrations import (
+    ensure_items_columns as _ensure_items_columns,
+    ensure_player_inventory_columns as _ensure_player_inventory_columns,
 )
 
 router = APIRouter(prefix="/api/blacksmith", tags=["blacksmith"])
@@ -192,7 +194,6 @@ async def _ensure_blacksmith_tables() -> None:
         )
 
         # --- еволюційні колонки (ВАЖЛИВО для старої прод-бази) ---
-        # blacksmith_recipes могло бути створене раніше без slot/level_req тощо
         await conn.execute("""ALTER TABLE blacksmith_recipes ADD COLUMN IF NOT EXISTS name text;""")
         await conn.execute("""ALTER TABLE blacksmith_recipes ADD COLUMN IF NOT EXISTS slot text NOT NULL DEFAULT 'weapon';""")
         await conn.execute("""ALTER TABLE blacksmith_recipes ADD COLUMN IF NOT EXISTS level_req int NOT NULL DEFAULT 1;""")
@@ -239,14 +240,14 @@ async def _ensure_blacksmith_tables() -> None:
             """
         )
 
-        # smelt еволюція (на випадок старих таблиць)
+        # smelt еволюція
         await conn.execute("""ALTER TABLE blacksmith_smelt_recipes ADD COLUMN IF NOT EXISTS name text;""")
         await conn.execute("""ALTER TABLE blacksmith_smelt_recipes ADD COLUMN IF NOT EXISTS output_item_code text;""")
         await conn.execute("""ALTER TABLE blacksmith_smelt_recipes ADD COLUMN IF NOT EXISTS output_amount int NOT NULL DEFAULT 1;""")
         await conn.execute("""ALTER TABLE blacksmith_smelt_recipes ADD COLUMN IF NOT EXISTS created_at timestamptz NOT NULL DEFAULT now();""")
         await conn.execute("""ALTER TABLE blacksmith_smelt_recipes ADD COLUMN IF NOT EXISTS updated_at timestamptz NOT NULL DEFAULT now();""")
 
-        # --- індекси (ПІСЛЯ ALTER, щоб не падало як у тебе) ---
+        # --- індекси (ПІСЛЯ ALTER, щоб не падало) ---
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_bsmith_recipes_slot ON blacksmith_recipes(slot);")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_bsmith_forge_tg ON player_blacksmith_forge(tg_id, status);")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_bsmith_smelt ON blacksmith_smelt_recipes(code);")
@@ -265,7 +266,8 @@ async def _seed_blacksmith_demo_if_empty() -> None:
                 VALUES
                   ('smith_knife_iron_1', 'Залізний ніж ремісника', 'weapon', 1, 45, 1.0/45.0, 0.65, 120, 220, 'knife_iron_01', 1),
                   ('smith_helm_iron_2',  'Клепаний шолом',         'helmet', 2, 80, 1.0/80.0, 0.68, 120, 220, 'helm_iron_01',  1),
-                  ('smith_chest_iron_3', 'Нагрудник із лускою',    'chest',  3, 140,1.0/140.0,0.72, 120, 220, 'chest_iron_01', 1)
+                  -- ✅ FIX: chest -> armor (бо канонічний слот у інвентарі armor)
+                  ('smith_chest_iron_3', 'Нагрудник із лускою',    'armor',  3, 140,1.0/140.0,0.72, 120, 220, 'chest_iron_01', 1)
                 ;
                 """
             )
