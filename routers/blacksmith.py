@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, HTTPException
 from loguru import logger
@@ -10,8 +10,12 @@ from pydantic import BaseModel, Field
 
 from db import get_pool
 
-# ✅ В ЦЬОМУ РЕПО give_item_to_player живе тут:
-from routers.inventory import give_item_to_player  # type: ignore
+# ✅ у цьому репо give_item_to_player + ensure'и живуть у routers/inventory.py
+from routers.inventory import (  # type: ignore
+    give_item_to_player,
+    _ensure_items_columns,
+    _ensure_player_inventory_columns,
+)
 
 router = APIRouter(prefix="/api/blacksmith", tags=["blacksmith"])
 
@@ -126,8 +130,13 @@ class SmeltStartResponse(BaseModel):
 # ─────────────────────────────────────────────
 
 async def _ensure_blacksmith_tables() -> None:
+    # ✅ важливо: items/player_inventory мають мати потрібні колонки ДО будь-яких запитів
+    await _ensure_items_columns()
+    await _ensure_player_inventory_columns()
+
     pool = await get_pool()
     async with pool.acquire() as conn:
+        # --- базові таблиці (створення) ---
         await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS blacksmith_recipes (
@@ -151,7 +160,6 @@ async def _ensure_blacksmith_tables() -> None:
             """
         )
 
-        # ⚠️ лишаємо назву material_code, але це item_code
         await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS blacksmith_recipe_ingredients (
@@ -183,12 +191,30 @@ async def _ensure_blacksmith_tables() -> None:
             """
         )
 
-        # ✅ еволюційні колонки
+        # --- еволюційні колонки (ВАЖЛИВО для старої прод-бази) ---
+        # blacksmith_recipes могло бути створене раніше без slot/level_req тощо
+        await conn.execute("""ALTER TABLE blacksmith_recipes ADD COLUMN IF NOT EXISTS name text;""")
+        await conn.execute("""ALTER TABLE blacksmith_recipes ADD COLUMN IF NOT EXISTS slot text NOT NULL DEFAULT 'weapon';""")
+        await conn.execute("""ALTER TABLE blacksmith_recipes ADD COLUMN IF NOT EXISTS level_req int NOT NULL DEFAULT 1;""")
+
+        await conn.execute("""ALTER TABLE blacksmith_recipes ADD COLUMN IF NOT EXISTS forge_hits int NOT NULL DEFAULT 60;""")
+        await conn.execute("""ALTER TABLE blacksmith_recipes ADD COLUMN IF NOT EXISTS base_progress_per_hit double precision NOT NULL DEFAULT 0.0166667;""")
+        await conn.execute("""ALTER TABLE blacksmith_recipes ADD COLUMN IF NOT EXISTS heat_sensitivity double precision NOT NULL DEFAULT 0.65;""")
+        await conn.execute("""ALTER TABLE blacksmith_recipes ADD COLUMN IF NOT EXISTS rhythm_min_ms int NOT NULL DEFAULT 120;""")
+        await conn.execute("""ALTER TABLE blacksmith_recipes ADD COLUMN IF NOT EXISTS rhythm_max_ms int NOT NULL DEFAULT 220;""")
+
+        await conn.execute("""ALTER TABLE blacksmith_recipes ADD COLUMN IF NOT EXISTS output_item_code text;""")
+        await conn.execute("""ALTER TABLE blacksmith_recipes ADD COLUMN IF NOT EXISTS output_amount int NOT NULL DEFAULT 1;""")
+
+        await conn.execute("""ALTER TABLE blacksmith_recipes ADD COLUMN IF NOT EXISTS created_at timestamptz NOT NULL DEFAULT now();""")
+        await conn.execute("""ALTER TABLE blacksmith_recipes ADD COLUMN IF NOT EXISTS updated_at timestamptz NOT NULL DEFAULT now();""")
+
+        # forge еволюція
         await conn.execute("""ALTER TABLE player_blacksmith_forge ADD COLUMN IF NOT EXISTS cancelled_at timestamptz NULL;""")
         await conn.execute("""ALTER TABLE player_blacksmith_forge ADD COLUMN IF NOT EXISTS client_hits int NULL;""")
         await conn.execute("""ALTER TABLE player_blacksmith_forge ADD COLUMN IF NOT EXISTS client_report jsonb NULL;""")
 
-        # ✅ smelting recipes
+        # smelting
         await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS blacksmith_smelt_recipes (
@@ -213,6 +239,14 @@ async def _ensure_blacksmith_tables() -> None:
             """
         )
 
+        # smelt еволюція (на випадок старих таблиць)
+        await conn.execute("""ALTER TABLE blacksmith_smelt_recipes ADD COLUMN IF NOT EXISTS name text;""")
+        await conn.execute("""ALTER TABLE blacksmith_smelt_recipes ADD COLUMN IF NOT EXISTS output_item_code text;""")
+        await conn.execute("""ALTER TABLE blacksmith_smelt_recipes ADD COLUMN IF NOT EXISTS output_amount int NOT NULL DEFAULT 1;""")
+        await conn.execute("""ALTER TABLE blacksmith_smelt_recipes ADD COLUMN IF NOT EXISTS created_at timestamptz NOT NULL DEFAULT now();""")
+        await conn.execute("""ALTER TABLE blacksmith_smelt_recipes ADD COLUMN IF NOT EXISTS updated_at timestamptz NOT NULL DEFAULT now();""")
+
+        # --- індекси (ПІСЛЯ ALTER, щоб не падало як у тебе) ---
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_bsmith_recipes_slot ON blacksmith_recipes(slot);")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_bsmith_forge_tg ON player_blacksmith_forge(tg_id, status);")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_bsmith_smelt ON blacksmith_smelt_recipes(code);")
@@ -610,12 +644,10 @@ async def _load_forge_recipes(conn: Any) -> List[RecipeDTO]:
                 name=str(r["name"]),
                 slot=str(r["slot"]),
                 level_req=int(r["level_req"] or 1),
-
                 forge_hits=hits,
                 base_progress_per_hit=base,
                 heat_sensitivity=float(r["heat_sensitivity"] or 0.65),
                 rhythm_window_ms=(int(r["rhythm_min_ms"] or 120), int(r["rhythm_max_ms"] or 220)),
-
                 output_item_code=str(r["output_item_code"]),
                 output_amount=int(r["output_amount"] or 1),
                 ingredients=ings_by.get(code, []),
@@ -698,9 +730,7 @@ async def forge_start(tg_id: int, body: ForgeStartBody) -> ForgeStartResponse:
         forge_id=forge_id,
         recipe_code=body.recipe_code,
         required_hits=int(r["forge_hits"] or 60),
-        base_progress_per_hit=float(
-            r["base_progress_per_hit"] or (1.0 / max(1, int(r["forge_hits"] or 60)))
-        ),
+        base_progress_per_hit=float(r["base_progress_per_hit"] or (1.0 / max(1, int(r["forge_hits"] or 60)))),
         heat_sensitivity=float(r["heat_sensitivity"] or 0.65),
         rhythm_window_ms=(int(r["rhythm_min_ms"] or 120), int(r["rhythm_max_ms"] or 220)),
     )
@@ -815,9 +845,8 @@ async def forge_claim(tg_id: int, body: ForgeClaimBody) -> ForgeClaimResponse:
                 raise HTTPException(404, "RECIPE_NOT_FOUND")
 
             started_at = f["started_at"]
-            if started_at:
-                if (datetime.now(timezone.utc) - started_at).total_seconds() < 2:
-                    raise HTTPException(400, "FORGE_TOO_FAST")
+            if started_at and (datetime.now(timezone.utc) - started_at).total_seconds() < 2:
+                raise HTTPException(400, "FORGE_TOO_FAST")
 
             client_hits = int((body.client_report or {}).get("hits") or 0)
             min_hits = max(1, int(int(f["required_hits"] or 1) * 0.40))
