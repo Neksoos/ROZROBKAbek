@@ -2,13 +2,13 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from db import get_pool
-from services.inventory.service import give_item_to_player  # ✅ FIX: правильний імпорт
+from services.inventory.service import give_item_to_player  # ✅ правильний імпорт
 
 router = APIRouter(prefix="/api/blacksmith", tags=["blacksmith"])
 
@@ -181,15 +181,9 @@ async def _ensure_blacksmith_tables() -> None:
         )
 
         # ✅ еволюційні колонки (без міграцій)
-        await conn.execute(
-            """ALTER TABLE player_blacksmith_forge ADD COLUMN IF NOT EXISTS cancelled_at timestamptz NULL;"""
-        )
-        await conn.execute(
-            """ALTER TABLE player_blacksmith_forge ADD COLUMN IF NOT EXISTS client_hits int NULL;"""
-        )
-        await conn.execute(
-            """ALTER TABLE player_blacksmith_forge ADD COLUMN IF NOT EXISTS client_report jsonb NULL;"""
-        )
+        await conn.execute("""ALTER TABLE player_blacksmith_forge ADD COLUMN IF NOT EXISTS cancelled_at timestamptz NULL;""")
+        await conn.execute("""ALTER TABLE player_blacksmith_forge ADD COLUMN IF NOT EXISTS client_hits int NULL;""")
+        await conn.execute("""ALTER TABLE player_blacksmith_forge ADD COLUMN IF NOT EXISTS client_report jsonb NULL;""")
 
         # ✅ smelting recipes
         await conn.execute(
@@ -216,19 +210,16 @@ async def _ensure_blacksmith_tables() -> None:
             """
         )
 
-        await conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_bsmith_recipes_slot ON blacksmith_recipes(slot);"
-        )
-        await conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_bsmith_forge_tg ON player_blacksmith_forge(tg_id, status);"
-        )
-        await conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_bsmith_smelt ON blacksmith_smelt_recipes(code);"
-        )
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_bsmith_recipes_slot ON blacksmith_recipes(slot);")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_bsmith_forge_tg ON player_blacksmith_forge(tg_id, status);")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_bsmith_smelt ON blacksmith_smelt_recipes(code);")
 
 
 async def _seed_blacksmith_demo_if_empty() -> None:
-    """Демо-рецепти кування + плавки, щоб сторінка вже працювала. Потім можеш прибрати."""
+    """
+    Демо-рецепти кування + плавки, щоб сторінка вже працювала.
+    Важливо: паливо робимо з вугільної жили (ore_vuhilna_zhyla), яка добувається в грі і є в items.
+    """
     pool = await get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow("SELECT count(*) AS c FROM blacksmith_recipes")
@@ -278,6 +269,7 @@ async def _seed_blacksmith_demo_if_empty() -> None:
                 """
                 INSERT INTO blacksmith_smelt_ingredients (recipe_code, material_code, qty, role)
                 VALUES
+                  -- ✅ ВУГІЛЬНА ЖИЛА (добувається в грі) → паливо коваля
                   ('smelt_fuel_1', 'ore_vuhilna_zhyla', 2, 'ore'),
 
                   ('smelt_iron_1', 'ore_ruda_zalizna', 3, 'ore'),
@@ -355,19 +347,33 @@ async def _deduct_inventory_items(conn, tg_id: int, ingredients: List[Ingredient
 
         item_id = await conn.fetchval("SELECT id FROM items WHERE code=$1", code)
         if not item_id:
-            raise HTTPException(400, "ITEM_CODE_NOT_FOUND")
+            raise HTTPException(400, detail={"code": "ITEM_CODE_NOT_FOUND", "item_code": code})
 
-        rows = await conn.fetch(
-            """
-            SELECT id, qty
-            FROM player_inventory
-            WHERE tg_id=$1 AND item_id=$2 AND is_equipped=FALSE
-            ORDER BY created_at ASC, id ASC
-            FOR UPDATE
-            """,
-            tg_id,
-            int(item_id),
-        )
+        # ✅ інколи в старих БД може не бути created_at — робимо фолбек
+        try:
+            rows = await conn.fetch(
+                """
+                SELECT id, qty
+                FROM player_inventory
+                WHERE tg_id=$1 AND item_id=$2 AND is_equipped=FALSE
+                ORDER BY created_at ASC, id ASC
+                FOR UPDATE
+                """,
+                tg_id,
+                int(item_id),
+            )
+        except Exception:
+            rows = await conn.fetch(
+                """
+                SELECT id, qty
+                FROM player_inventory
+                WHERE tg_id=$1 AND item_id=$2 AND is_equipped=FALSE
+                ORDER BY id ASC
+                FOR UPDATE
+                """,
+                tg_id,
+                int(item_id),
+            )
 
         remaining = need
         for r in rows:
@@ -393,14 +399,29 @@ async def _deduct_inventory_items(conn, tg_id: int, ingredients: List[Ingredient
             remaining -= take
 
         if remaining > 0:
-            raise HTTPException(500, "INVENTORY_DEDUCT_FAILED")
+            raise HTTPException(500, detail={"code": "INVENTORY_DEDUCT_FAILED", "item_code": code})
 
 
 async def _get_item_meta(conn, item_code: str) -> Dict[str, Optional[str]]:
-    row = await conn.fetchrow(
-        "SELECT code, name, category, emoji, rarity, description, slot FROM items WHERE code=$1",
-        item_code,
-    )
+    """
+    ✅ Робимо максимально сумісно:
+    - у частині БД є items.description
+    - у частині seed'ів заповнюється items.descr
+    Тому беремо description || descr.
+    """
+    row: Any = None
+    try:
+        row = await conn.fetchrow(
+            "SELECT code, name, category, emoji, rarity, description, descr, slot FROM items WHERE code=$1",
+            item_code,
+        )
+    except Exception:
+        # якщо раптом нема description — не валимось
+        row = await conn.fetchrow(
+            "SELECT code, name, category, emoji, rarity, descr, slot FROM items WHERE code=$1",
+            item_code,
+        )
+
     if not row:
         return {
             "name": item_code,
@@ -410,12 +431,20 @@ async def _get_item_meta(conn, item_code: str) -> Dict[str, Optional[str]]:
             "description": None,
             "slot": None,
         }
+
+    descr_val = None
+    try:
+        descr_val = row.get("description") or row.get("descr")
+    except Exception:
+        # asyncpg Record може не мати get()
+        descr_val = (row["description"] if "description" in row else None) or (row["descr"] if "descr" in row else None)
+
     return {
         "name": str(row["name"]),
         "category": row["category"],
         "emoji": row["emoji"],
         "rarity": row["rarity"],
-        "description": row["description"],
+        "description": descr_val,
         "slot": row["slot"],
     }
 
@@ -438,6 +467,28 @@ async def _load_recipe_ingredients(conn, recipe_code: str) -> List[IngredientDTO
         )
         for x in (irows or [])
     ]
+
+
+# ─────────────────────────────────────────────
+# DEBUG: перевірка items (щоб “провірити” ore_vuhilna_zhyla на проді)
+# ─────────────────────────────────────────────
+
+@router.get("/debug/items/presence")
+async def debug_items_presence(
+    codes: str = Query(..., description="comma-separated item codes"),
+) -> Dict[str, bool]:
+    want = [c.strip() for c in (codes or "").split(",") if c.strip()]
+    if not want:
+        raise HTTPException(400, "NO_CODES")
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT code FROM items WHERE code = ANY($1::text[])",
+            want,
+        )
+    have = {str(r["code"]) for r in (rows or [])}
+    return {c: (c in have) for c in want}
 
 
 # ─────────────────────────────────────────────
@@ -713,7 +764,6 @@ async def forge_cancel(tg_id: int, body: ForgeCancelBody) -> ForgeCancelResponse
     await _ensure_blacksmith_tables()
 
     pool = await get_pool()
-    # ingredients забираємо в транзакції, а refound робимо поза нею
     ingredients: List[IngredientDTO] = []
 
     async with pool.acquire() as conn:
@@ -752,7 +802,6 @@ async def forge_cancel(tg_id: int, body: ForgeCancelBody) -> ForgeCancelResponse
                 body.client_report,
             )
 
-    # повертаємо інгредієнти назад
     pool2 = await get_pool()
     async with pool2.acquire() as conn2:
         for ing in ingredients:
