@@ -10,7 +10,7 @@ from services.inventory.models import (
     UnequipSlotRequest,
 )
 
-# re-export з service
+# ✅ re-export для сумісності зі старими імпортами
 from services.inventory.service import (
     give_item_to_player,
     consume,
@@ -29,17 +29,20 @@ router = APIRouter(prefix="/api/inventory", tags=["inventory"])
 # ─────────────────────────────
 @router.post("/equip/{inv_id}")
 async def equip_item(inv_id: int, req: EquipRequest):
-    return await equip(inv_id, req)
+    await equip(inv_id, req.tg_id)
+    return {"ok": True}
 
 
 @router.post("/unequip/{inv_id}")
 async def unequip_item(inv_id: int, req: EquipRequest):
-    return await unequip(inv_id, req)
+    await unequip(inv_id, req.tg_id)
+    return {"ok": True}
 
 
 @router.post("/unequip-slot/{slot}")
 async def unequip_slot_item(slot: str, req: UnequipSlotRequest):
-    return await unequip_slot(slot, req)
+    await unequip_slot(slot, req.tg_id)
+    return {"ok": True}
 
 
 # ─────────────────────────────
@@ -60,4 +63,4 @@ async def get_item_api(inv_id: int, tg_id: int = Query(...)):
 # ─────────────────────────────
 @router.post("/consume/{inv_id}")
 async def consume_api(inv_id: int, req: ConsumeRequest):
-    return await consume(inv_id, req)
+    return await consume(inv_id, req.tg_id, req.qty)
