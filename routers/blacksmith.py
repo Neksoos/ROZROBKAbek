@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
@@ -181,9 +181,15 @@ async def _ensure_blacksmith_tables() -> None:
         )
 
         # ✅ еволюційні колонки (без міграцій)
-        await conn.execute("""ALTER TABLE player_blacksmith_forge ADD COLUMN IF NOT EXISTS cancelled_at timestamptz NULL;""")
-        await conn.execute("""ALTER TABLE player_blacksmith_forge ADD COLUMN IF NOT EXISTS client_hits int NULL;""")
-        await conn.execute("""ALTER TABLE player_blacksmith_forge ADD COLUMN IF NOT EXISTS client_report jsonb NULL;""")
+        await conn.execute(
+            """ALTER TABLE player_blacksmith_forge ADD COLUMN IF NOT EXISTS cancelled_at timestamptz NULL;"""
+        )
+        await conn.execute(
+            """ALTER TABLE player_blacksmith_forge ADD COLUMN IF NOT EXISTS client_hits int NULL;"""
+        )
+        await conn.execute(
+            """ALTER TABLE player_blacksmith_forge ADD COLUMN IF NOT EXISTS client_report jsonb NULL;"""
+        )
 
         # ✅ smelting recipes
         await conn.execute(
@@ -210,9 +216,15 @@ async def _ensure_blacksmith_tables() -> None:
             """
         )
 
-        await conn.execute("CREATE INDEX IF NOT EXISTS idx_bsmith_recipes_slot ON blacksmith_recipes(slot);")
-        await conn.execute("CREATE INDEX IF NOT EXISTS idx_bsmith_forge_tg ON player_blacksmith_forge(tg_id, status);")
-        await conn.execute("CREATE INDEX IF NOT EXISTS idx_bsmith_smelt ON blacksmith_smelt_recipes(code);")
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_bsmith_recipes_slot ON blacksmith_recipes(slot);"
+        )
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_bsmith_forge_tg ON player_blacksmith_forge(tg_id, status);"
+        )
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_bsmith_smelt ON blacksmith_smelt_recipes(code);"
+        )
 
 
 async def _seed_blacksmith_demo_if_empty() -> None:
@@ -685,7 +697,9 @@ async def forge_start(tg_id: int, body: ForgeStartBody) -> ForgeStartResponse:
         forge_id=forge_id,
         recipe_code=body.recipe_code,
         required_hits=int(r["forge_hits"] or 60),
-        base_progress_per_hit=float(r["base_progress_per_hit"] or (1.0 / max(1, int(r["forge_hits"] or 60)))),
+        base_progress_per_hit=float(
+            r["base_progress_per_hit"] or (1.0 / max(1, int(r["forge_hits"] or 60)))
+        ),
         heat_sensitivity=float(r["heat_sensitivity"] or 0.65),
         rhythm_window_ms=(int(r["rhythm_min_ms"] or 120), int(r["rhythm_max_ms"] or 220)),
     )
@@ -698,8 +712,10 @@ async def forge_cancel(tg_id: int, body: ForgeCancelBody) -> ForgeCancelResponse
 
     await _ensure_blacksmith_tables()
 
-    # 1) у транзакції: перевірити forge, помітити cancelled
     pool = await get_pool()
+    # ingredients забираємо в транзакції, а refound робимо поза нею
+    ingredients: List[IngredientDTO] = []
+
     async with pool.acquire() as conn:
         async with conn.transaction():
             f = await conn.fetchrow(
@@ -720,7 +736,6 @@ async def forge_cancel(tg_id: int, body: ForgeCancelBody) -> ForgeCancelResponse
             if str(f["recipe_code"]) != body.recipe_code:
                 raise HTTPException(400, "RECIPE_MISMATCH")
 
-            # інгредієнти потрібні для refund
             ingredients = await _load_recipe_ingredients(conn, body.recipe_code)
 
             await conn.execute(
@@ -737,11 +752,9 @@ async def forge_cancel(tg_id: int, body: ForgeCancelBody) -> ForgeCancelResponse
                 body.client_report,
             )
 
-    # 2) поза транзакцією: повернути інгредієнти в інвентар
-    #    (використовуємо give_item_to_player як у smelt/claim)
+    # повертаємо інгредієнти назад
     pool2 = await get_pool()
     async with pool2.acquire() as conn2:
-        # мету підтягуємо з items
         for ing in ingredients:
             code = str(ing.material_code)
             qty = int(ing.qty)
@@ -802,16 +815,12 @@ async def forge_claim(tg_id: int, body: ForgeClaimBody) -> ForgeClaimResponse:
             if not rr:
                 raise HTTPException(404, "RECIPE_NOT_FOUND")
 
-            # легка “санітарна” перевірка, щоб зовсім не було claim одразу:
             started_at = f["started_at"]
             if started_at:
-                # мінімум 2 секунди (прибрати/змінити якщо не треба)
                 if (datetime.now(timezone.utc) - started_at).total_seconds() < 2:
                     raise HTTPException(400, "FORGE_TOO_FAST")
 
             client_hits = int((body.client_report or {}).get("hits") or 0)
-            # не блокуємо гравця, який зробив менше ударів через бонуси,
-            # але відсікаємо очевидний “0 ударів”
             min_hits = max(1, int(int(f["required_hits"] or 1) * 0.40))
             if client_hits and client_hits < min_hits:
                 raise HTTPException(400, detail={"code": "NOT_ENOUGH_HITS", "min_hits": min_hits})
@@ -847,3 +856,4 @@ async def forge_claim(tg_id: int, body: ForgeClaimBody) -> ForgeClaimResponse:
     )
 
     return ForgeClaimResponse(ok=True, item_code=item_code, amount=amount)
+```0
