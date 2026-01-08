@@ -2,13 +2,16 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException
+from loguru import logger
 from pydantic import BaseModel, Field
 
 from db import get_pool
-from services.inventory.service import give_item_to_player  # ✅ правильний імпорт
+
+# ✅ В ЦЬОМУ РЕПО give_item_to_player живе тут:
+from routers.inventory import give_item_to_player  # type: ignore
 
 router = APIRouter(prefix="/api/blacksmith", tags=["blacksmith"])
 
@@ -18,7 +21,7 @@ router = APIRouter(prefix="/api/blacksmith", tags=["blacksmith"])
 # ─────────────────────────────────────────────
 
 class IngredientDTO(BaseModel):
-    # ⚠️ лишаю назву як було (material_code), але це item_code з таблиці items
+    # ⚠️ назва material_code лишається як у фронті, але це item_code з таблиці items
     material_code: str
     qty: int
     role: str = "metal"
@@ -180,7 +183,7 @@ async def _ensure_blacksmith_tables() -> None:
             """
         )
 
-        # ✅ еволюційні колонки (без міграцій)
+        # ✅ еволюційні колонки
         await conn.execute("""ALTER TABLE player_blacksmith_forge ADD COLUMN IF NOT EXISTS cancelled_at timestamptz NULL;""")
         await conn.execute("""ALTER TABLE player_blacksmith_forge ADD COLUMN IF NOT EXISTS client_hits int NULL;""")
         await conn.execute("""ALTER TABLE player_blacksmith_forge ADD COLUMN IF NOT EXISTS client_report jsonb NULL;""")
@@ -216,10 +219,7 @@ async def _ensure_blacksmith_tables() -> None:
 
 
 async def _seed_blacksmith_demo_if_empty() -> None:
-    """
-    Демо-рецепти кування + плавки, щоб сторінка вже працювала.
-    Важливо: паливо робимо з вугільної жили (ore_vuhilna_zhyla), яка добувається в грі і є в items.
-    """
+    """Демо-рецепти кування + плавки, щоб сторінка вже працювала. Потім можеш прибрати."""
     pool = await get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow("SELECT count(*) AS c FROM blacksmith_recipes")
@@ -231,7 +231,7 @@ async def _seed_blacksmith_demo_if_empty() -> None:
                 VALUES
                   ('smith_knife_iron_1', 'Залізний ніж ремісника', 'weapon', 1, 45, 1.0/45.0, 0.65, 120, 220, 'knife_iron_01', 1),
                   ('smith_helm_iron_2',  'Клепаний шолом',         'helmet', 2, 80, 1.0/80.0, 0.68, 120, 220, 'helm_iron_01',  1),
-                  ('smith_chest_iron_3', 'Нагрудник із лускою',    'armor',  3, 140,1.0/140.0,0.72, 120, 220, 'chest_iron_01', 1)
+                  ('smith_chest_iron_3', 'Нагрудник із лускою',    'chest',  3, 140,1.0/140.0,0.72, 120, 220, 'chest_iron_01', 1)
                 ;
                 """
             )
@@ -269,7 +269,6 @@ async def _seed_blacksmith_demo_if_empty() -> None:
                 """
                 INSERT INTO blacksmith_smelt_ingredients (recipe_code, material_code, qty, role)
                 VALUES
-                  -- ✅ ВУГІЛЬНА ЖИЛА (добувається в грі) → паливо коваля
                   ('smelt_fuel_1', 'ore_vuhilna_zhyla', 2, 'ore'),
 
                   ('smelt_iron_1', 'ore_ruda_zalizna', 3, 'ore'),
@@ -292,7 +291,7 @@ async def _seed_blacksmith_demo_if_empty() -> None:
 # helpers (INVENTORY)
 # ─────────────────────────────────────────────
 
-async def _player_inventory_qty_by_code(conn, tg_id: int) -> Dict[str, int]:
+async def _player_inventory_qty_by_code(conn: Any, tg_id: int) -> Dict[str, int]:
     rows = await conn.fetch(
         """
         SELECT i.code AS code, COALESCE(SUM(pi.qty), 0)::int AS qty
@@ -330,7 +329,7 @@ def _calc_missing_inventory(
     return (len(missing) == 0), missing
 
 
-async def _deduct_inventory_items(conn, tg_id: int, ingredients: List[IngredientDTO]) -> None:
+async def _deduct_inventory_items(conn: Any, tg_id: int, ingredients: List[IngredientDTO]) -> None:
     have_by_code = await _player_inventory_qty_by_code(conn, tg_id)
     ok, miss = _calc_missing_inventory(ingredients, have_by_code)
     if not ok:
@@ -349,31 +348,17 @@ async def _deduct_inventory_items(conn, tg_id: int, ingredients: List[Ingredient
         if not item_id:
             raise HTTPException(400, detail={"code": "ITEM_CODE_NOT_FOUND", "item_code": code})
 
-        # ✅ інколи в старих БД може не бути created_at — робимо фолбек
-        try:
-            rows = await conn.fetch(
-                """
-                SELECT id, qty
-                FROM player_inventory
-                WHERE tg_id=$1 AND item_id=$2 AND is_equipped=FALSE
-                ORDER BY created_at ASC, id ASC
-                FOR UPDATE
-                """,
-                tg_id,
-                int(item_id),
-            )
-        except Exception:
-            rows = await conn.fetch(
-                """
-                SELECT id, qty
-                FROM player_inventory
-                WHERE tg_id=$1 AND item_id=$2 AND is_equipped=FALSE
-                ORDER BY id ASC
-                FOR UPDATE
-                """,
-                tg_id,
-                int(item_id),
-            )
+        rows = await conn.fetch(
+            """
+            SELECT id, qty
+            FROM player_inventory
+            WHERE tg_id=$1 AND item_id=$2 AND is_equipped=FALSE
+            ORDER BY created_at ASC, id ASC
+            FOR UPDATE
+            """,
+            tg_id,
+            int(item_id),
+        )
 
         remaining = need
         for r in rows:
@@ -399,29 +384,14 @@ async def _deduct_inventory_items(conn, tg_id: int, ingredients: List[Ingredient
             remaining -= take
 
         if remaining > 0:
-            raise HTTPException(500, detail={"code": "INVENTORY_DEDUCT_FAILED", "item_code": code})
+            raise HTTPException(500, "INVENTORY_DEDUCT_FAILED")
 
 
-async def _get_item_meta(conn, item_code: str) -> Dict[str, Optional[str]]:
-    """
-    ✅ Робимо максимально сумісно:
-    - у частині БД є items.description
-    - у частині seed'ів заповнюється items.descr
-    Тому беремо description || descr.
-    """
-    row: Any = None
-    try:
-        row = await conn.fetchrow(
-            "SELECT code, name, category, emoji, rarity, description, descr, slot FROM items WHERE code=$1",
-            item_code,
-        )
-    except Exception:
-        # якщо раптом нема description — не валимось
-        row = await conn.fetchrow(
-            "SELECT code, name, category, emoji, rarity, descr, slot FROM items WHERE code=$1",
-            item_code,
-        )
-
+async def _get_item_meta(conn: Any, item_code: str) -> Dict[str, Optional[str]]:
+    row = await conn.fetchrow(
+        "SELECT code, name, category, emoji, rarity, description, slot FROM items WHERE code=$1",
+        item_code,
+    )
     if not row:
         return {
             "name": item_code,
@@ -431,25 +401,17 @@ async def _get_item_meta(conn, item_code: str) -> Dict[str, Optional[str]]:
             "description": None,
             "slot": None,
         }
-
-    descr_val = None
-    try:
-        descr_val = row.get("description") or row.get("descr")
-    except Exception:
-        # asyncpg Record може не мати get()
-        descr_val = (row["description"] if "description" in row else None) or (row["descr"] if "descr" in row else None)
-
     return {
         "name": str(row["name"]),
         "category": row["category"],
         "emoji": row["emoji"],
         "rarity": row["rarity"],
-        "description": descr_val,
+        "description": row["description"],
         "slot": row["slot"],
     }
 
 
-async def _load_recipe_ingredients(conn, recipe_code: str) -> List[IngredientDTO]:
+async def _load_recipe_ingredients(conn: Any, recipe_code: str) -> List[IngredientDTO]:
     irows = await conn.fetch(
         """
         SELECT material_code, qty, role
@@ -470,32 +432,10 @@ async def _load_recipe_ingredients(conn, recipe_code: str) -> List[IngredientDTO
 
 
 # ─────────────────────────────────────────────
-# DEBUG: перевірка items (щоб “провірити” ore_vuhilna_zhyla на проді)
-# ─────────────────────────────────────────────
-
-@router.get("/debug/items/presence")
-async def debug_items_presence(
-    codes: str = Query(..., description="comma-separated item codes"),
-) -> Dict[str, bool]:
-    want = [c.strip() for c in (codes or "").split(",") if c.strip()]
-    if not want:
-        raise HTTPException(400, "NO_CODES")
-
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT code FROM items WHERE code = ANY($1::text[])",
-            want,
-        )
-    have = {str(r["code"]) for r in (rows or [])}
-    return {c: (c in have) for c in want}
-
-
-# ─────────────────────────────────────────────
 # endpoints: SMELT
 # ─────────────────────────────────────────────
 
-async def _load_smelt_recipes(conn) -> List[SmeltRecipeDTO]:
+async def _load_smelt_recipes(conn: Any) -> List[SmeltRecipeDTO]:
     rrows = await conn.fetch(
         """
         SELECT code, name, output_item_code, output_amount
@@ -564,42 +504,52 @@ async def smelt_start(tg_id: int, body: SmeltStartBody) -> SmeltStartResponse:
     await _ensure_blacksmith_tables()
     await _seed_blacksmith_demo_if_empty()
 
+    item_code: str
+    amount: int
+    meta: Dict[str, Optional[str]]
+
     pool = await get_pool()
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            rr = await conn.fetchrow(
-                """
-                SELECT output_item_code, output_amount
-                FROM blacksmith_smelt_recipes
-                WHERE code=$1
-                """,
-                body.recipe_code,
-            )
-            if not rr:
-                raise HTTPException(404, "SMELT_RECIPE_NOT_FOUND")
-
-            irows = await conn.fetch(
-                """
-                SELECT material_code, qty, role
-                FROM blacksmith_smelt_ingredients
-                WHERE recipe_code=$1
-                """,
-                body.recipe_code,
-            )
-            ingredients = [
-                IngredientDTO(
-                    material_code=str(x["material_code"]),
-                    qty=int(x["qty"]),
-                    role=str(x["role"]),
+    try:
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                rr = await conn.fetchrow(
+                    """
+                    SELECT output_item_code, output_amount
+                    FROM blacksmith_smelt_recipes
+                    WHERE code=$1
+                    """,
+                    body.recipe_code,
                 )
-                for x in irows
-            ]
+                if not rr:
+                    raise HTTPException(404, "SMELT_RECIPE_NOT_FOUND")
 
-            await _deduct_inventory_items(conn, tg_id, ingredients)
+                irows = await conn.fetch(
+                    """
+                    SELECT material_code, qty, role
+                    FROM blacksmith_smelt_ingredients
+                    WHERE recipe_code=$1
+                    """,
+                    body.recipe_code,
+                )
+                ingredients = [
+                    IngredientDTO(
+                        material_code=str(x["material_code"]),
+                        qty=int(x["qty"]),
+                        role=str(x["role"]),
+                    )
+                    for x in irows
+                ]
 
-            item_code = str(rr["output_item_code"])
-            amount = int(rr["output_amount"] or 1)
-            meta = await _get_item_meta(conn, item_code)
+                await _deduct_inventory_items(conn, tg_id, ingredients)
+
+                item_code = str(rr["output_item_code"])
+                amount = int(rr["output_amount"] or 1)
+                meta = await _get_item_meta(conn, item_code)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(f"smelt_start failed: tg_id={tg_id} recipe={body.recipe_code}")
+        raise HTTPException(500, detail={"code": "SMELT_INTERNAL", "error": str(e)})
 
     await give_item_to_player(
         tg_id=tg_id,
@@ -620,7 +570,7 @@ async def smelt_start(tg_id: int, body: SmeltStartBody) -> SmeltStartResponse:
 # endpoints: FORGE
 # ─────────────────────────────────────────────
 
-async def _load_forge_recipes(conn) -> List[RecipeDTO]:
+async def _load_forge_recipes(conn: Any) -> List[RecipeDTO]:
     rrows = await conn.fetch(
         """
         SELECT code, name, slot, level_req,
