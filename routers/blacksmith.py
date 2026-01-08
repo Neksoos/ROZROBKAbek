@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
@@ -78,6 +78,17 @@ class ForgeClaimResponse(BaseModel):
     ok: bool = True
     item_code: str
     amount: int
+
+
+class ForgeCancelBody(BaseModel):
+    forge_id: int
+    recipe_code: str
+    client_report: Optional[dict] = None
+
+
+class ForgeCancelResponse(BaseModel):
+    ok: bool = True
+    refunded: bool = True
 
 
 # ✅ Smelting DTOs (руда → злитки)
@@ -168,6 +179,11 @@ async def _ensure_blacksmith_tables() -> None:
             );
             """
         )
+
+        # ✅ еволюційні колонки (без міграцій)
+        await conn.execute("""ALTER TABLE player_blacksmith_forge ADD COLUMN IF NOT EXISTS cancelled_at timestamptz NULL;""")
+        await conn.execute("""ALTER TABLE player_blacksmith_forge ADD COLUMN IF NOT EXISTS client_hits int NULL;""")
+        await conn.execute("""ALTER TABLE player_blacksmith_forge ADD COLUMN IF NOT EXISTS client_report jsonb NULL;""")
 
         # ✅ smelting recipes
         await conn.execute(
@@ -319,7 +335,6 @@ async def _deduct_inventory_items(conn, tg_id: int, ingredients: List[Ingredient
             detail={"code": "NOT_ENOUGH_ITEMS", "missing": [m.dict() for m in miss]},
         )
 
-    # Списання по кожному item_code: зі старих рядків → нові
     for ing in ingredients:
         code = str(ing.material_code)
         need = int(ing.qty)
@@ -391,6 +406,26 @@ async def _get_item_meta(conn, item_code: str) -> Dict[str, Optional[str]]:
         "description": row["description"],
         "slot": row["slot"],
     }
+
+
+async def _load_recipe_ingredients(conn, recipe_code: str) -> List[IngredientDTO]:
+    irows = await conn.fetch(
+        """
+        SELECT material_code, qty, role
+        FROM blacksmith_recipe_ingredients
+        WHERE recipe_code=$1
+        ORDER BY role, material_code
+        """,
+        recipe_code,
+    )
+    return [
+        IngredientDTO(
+            material_code=str(x["material_code"]),
+            qty=int(x["qty"]),
+            role=str(x["role"]),
+        )
+        for x in (irows or [])
+    ]
 
 
 # ─────────────────────────────────────────────
@@ -619,23 +654,7 @@ async def forge_start(tg_id: int, body: ForgeStartBody) -> ForgeStartResponse:
             if not r:
                 raise HTTPException(404, "RECIPE_NOT_FOUND")
 
-            irows = await conn.fetch(
-                """
-                SELECT material_code, qty, role
-                FROM blacksmith_recipe_ingredients
-                WHERE recipe_code=$1
-                """,
-                body.recipe_code,
-            )
-            ingredients = [
-                IngredientDTO(
-                    material_code=str(x["material_code"]),
-                    qty=int(x["qty"]),
-                    role=str(x["role"]),
-                )
-                for x in irows
-            ]
-
+            ingredients = await _load_recipe_ingredients(conn, body.recipe_code)
             await _deduct_inventory_items(conn, tg_id, ingredients)
 
             started_at = datetime.now(timezone.utc)
@@ -672,6 +691,78 @@ async def forge_start(tg_id: int, body: ForgeStartBody) -> ForgeStartResponse:
     )
 
 
+@router.post("/forge/cancel", response_model=ForgeCancelResponse)
+async def forge_cancel(tg_id: int, body: ForgeCancelBody) -> ForgeCancelResponse:
+    if tg_id <= 0:
+        raise HTTPException(400, "INVALID_TG_ID")
+
+    await _ensure_blacksmith_tables()
+
+    # 1) у транзакції: перевірити forge, помітити cancelled
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            f = await conn.fetchrow(
+                """
+                SELECT id, tg_id, recipe_code, status
+                FROM player_blacksmith_forge
+                WHERE id=$1
+                FOR UPDATE
+                """,
+                body.forge_id,
+            )
+            if not f:
+                raise HTTPException(404, "FORGE_NOT_FOUND")
+            if int(f["tg_id"]) != tg_id:
+                raise HTTPException(403, "FORGE_NOT_YOURS")
+            if str(f["status"]) != "started":
+                raise HTTPException(400, "FORGE_NOT_ACTIVE")
+            if str(f["recipe_code"]) != body.recipe_code:
+                raise HTTPException(400, "RECIPE_MISMATCH")
+
+            # інгредієнти потрібні для refund
+            ingredients = await _load_recipe_ingredients(conn, body.recipe_code)
+
+            await conn.execute(
+                """
+                UPDATE player_blacksmith_forge
+                   SET status='cancelled',
+                       cancelled_at=now(),
+                       client_hits=$2,
+                       client_report=$3
+                 WHERE id=$1
+                """,
+                body.forge_id,
+                int((body.client_report or {}).get("hits") or 0),
+                body.client_report,
+            )
+
+    # 2) поза транзакцією: повернути інгредієнти в інвентар
+    #    (використовуємо give_item_to_player як у smelt/claim)
+    pool2 = await get_pool()
+    async with pool2.acquire() as conn2:
+        # мету підтягуємо з items
+        for ing in ingredients:
+            code = str(ing.material_code)
+            qty = int(ing.qty)
+            if qty <= 0:
+                continue
+            meta = await _get_item_meta(conn2, code)
+            await give_item_to_player(
+                tg_id=tg_id,
+                item_code=code,
+                name=meta["name"] or code,
+                category=meta["category"],
+                emoji=meta["emoji"],
+                rarity=meta["rarity"],
+                description=meta["description"],
+                qty=qty,
+                slot=meta["slot"],
+            )
+
+    return ForgeCancelResponse(ok=True, refunded=True)
+
+
 @router.post("/forge/claim", response_model=ForgeClaimResponse)
 async def forge_claim(tg_id: int, body: ForgeClaimBody) -> ForgeClaimResponse:
     if tg_id <= 0:
@@ -684,7 +775,7 @@ async def forge_claim(tg_id: int, body: ForgeClaimBody) -> ForgeClaimResponse:
         async with conn.transaction():
             f = await conn.fetchrow(
                 """
-                SELECT id, tg_id, recipe_code, status
+                SELECT id, tg_id, recipe_code, status, required_hits, started_at
                 FROM player_blacksmith_forge
                 WHERE id=$1
                 FOR UPDATE
@@ -711,6 +802,20 @@ async def forge_claim(tg_id: int, body: ForgeClaimBody) -> ForgeClaimResponse:
             if not rr:
                 raise HTTPException(404, "RECIPE_NOT_FOUND")
 
+            # легка “санітарна” перевірка, щоб зовсім не було claim одразу:
+            started_at = f["started_at"]
+            if started_at:
+                # мінімум 2 секунди (прибрати/змінити якщо не треба)
+                if (datetime.now(timezone.utc) - started_at).total_seconds() < 2:
+                    raise HTTPException(400, "FORGE_TOO_FAST")
+
+            client_hits = int((body.client_report or {}).get("hits") or 0)
+            # не блокуємо гравця, який зробив менше ударів через бонуси,
+            # але відсікаємо очевидний “0 ударів”
+            min_hits = max(1, int(int(f["required_hits"] or 1) * 0.40))
+            if client_hits and client_hits < min_hits:
+                raise HTTPException(400, detail={"code": "NOT_ENOUGH_HITS", "min_hits": min_hits})
+
             item_code = str(rr["output_item_code"])
             amount = int(rr["output_amount"] or 1)
             meta = await _get_item_meta(conn, item_code)
@@ -719,10 +824,14 @@ async def forge_claim(tg_id: int, body: ForgeClaimBody) -> ForgeClaimResponse:
                 """
                 UPDATE player_blacksmith_forge
                    SET status='claimed',
-                       claimed_at=now()
+                       claimed_at=now(),
+                       client_hits=$2,
+                       client_report=$3
                  WHERE id=$1
                 """,
                 body.forge_id,
+                client_hits,
+                body.client_report,
             )
 
     await give_item_to_player(
