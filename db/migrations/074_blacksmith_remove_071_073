@@ -1,0 +1,115 @@
+-- 074_blacksmith_remove_071_073.sql
+-- ВИДАЛЯЄ все, що було створено/засіяно міграціями 071-073 (нова queue-схема коваля),
+-- і ПОВЕРТАЄ legacy-таблиці (якщо їх було перейменовано у *_old).
+-- Ідемпотентна: можна запускати багато разів.
+
+BEGIN;
+
+-- =========================================================
+-- 0) Прибрати view + function (072)
+-- =========================================================
+DROP VIEW IF EXISTS v_player_blacksmith_active;
+DROP FUNCTION IF EXISTS blacksmith_refresh_queue(bigint);
+
+-- =========================================================
+-- 1) Прибрати queue-таблицю (072)
+-- =========================================================
+DROP TABLE IF EXISTS player_blacksmith_queue;
+
+-- =========================================================
+-- 2) Прибрати НОВІ blacksmith_recipes / ingredients (072),
+--    але тільки якщо це саме нова схема (є output_kind / input_kind).
+--    Потім повернути legacy таблиці з *_old назад.
+-- =========================================================
+DO $$
+DECLARE
+  has_new_recipes boolean;
+  has_new_ings boolean;
+BEGIN
+  SELECT EXISTS (
+    SELECT 1
+    FROM information_schema.columns
+    WHERE table_schema='public'
+      AND table_name='blacksmith_recipes'
+      AND column_name='output_kind'
+  ) INTO has_new_recipes;
+
+  SELECT EXISTS (
+    SELECT 1
+    FROM information_schema.columns
+    WHERE table_schema='public'
+      AND table_name='blacksmith_recipe_ingredients'
+      AND column_name='input_kind'
+  ) INTO has_new_ings;
+
+  -- якщо це нова схема — зносимо її
+  IF has_new_ings THEN
+    EXECUTE 'DROP TABLE IF EXISTS blacksmith_recipe_ingredients';
+  END IF;
+
+  IF has_new_recipes THEN
+    -- якщо ingredients вже нема — ок
+    EXECUTE 'DROP TABLE IF EXISTS blacksmith_recipes';
+  END IF;
+
+  -- Повертаємо legacy таблиці, якщо 072 їх перейменував у *_old
+  IF to_regclass('public.blacksmith_recipes_old') IS NOT NULL THEN
+    IF to_regclass('public.blacksmith_recipes') IS NULL THEN
+      EXECUTE 'ALTER TABLE blacksmith_recipes_old RENAME TO blacksmith_recipes';
+    END IF;
+  END IF;
+
+  IF to_regclass('public.blacksmith_recipe_ingredients_old') IS NOT NULL THEN
+    IF to_regclass('public.blacksmith_recipe_ingredients') IS NULL THEN
+      EXECUTE 'ALTER TABLE blacksmith_recipe_ingredients_old RENAME TO blacksmith_recipe_ingredients';
+    END IF;
+  END IF;
+END $$;
+
+-- =========================================================
+-- 3) Видалити сіднуті айтеми з 073 (і прибрати їх з інвентаря)
+-- =========================================================
+
+-- Спочатку чистимо player_inventory, бо FK items(id) = RESTRICT
+DELETE FROM player_inventory
+WHERE item_id IN (
+  SELECT id FROM items
+  WHERE code IN (
+    'smith_weapon_zaliznyi_klynok',
+    'smith_helmet_zaliznyi',
+    'smith_armor_zaliznyi'
+  )
+);
+
+-- Якщо у вас лишилась табличка item_equipment_stats (старий експеримент),
+-- то прибираємо і звідти (на випадок якщо є)
+DO $$
+BEGIN
+  IF to_regclass('public.item_equipment_stats') IS NOT NULL THEN
+    EXECUTE $q$
+      DELETE FROM item_equipment_stats
+      WHERE item_code IN (
+        'smith_weapon_zaliznyi_klynok',
+        'smith_helmet_zaliznyi',
+        'smith_armor_zaliznyi'
+      )
+    $q$;
+  END IF;
+END $$;
+
+-- Тепер видаляємо самі items
+DELETE FROM items
+WHERE code IN (
+  'smith_weapon_zaliznyi_klynok',
+  'smith_helmet_zaliznyi',
+  'smith_armor_zaliznyi'
+);
+
+-- =========================================================
+-- 4) Видалити універсальні craft_materials з 071
+--    (player_materials мають ON DELETE CASCADE)
+-- =========================================================
+DELETE FROM craft_materials
+WHERE code IN ('smith_reagent', 'smith_quench_mix');
+
+COMMIT;
