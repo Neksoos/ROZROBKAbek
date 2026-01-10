@@ -4,7 +4,7 @@ from __future__ import annotations
 from typing import Optional
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 from loguru import logger
 
@@ -16,6 +16,9 @@ from services.energy import BASE_ENERGY_MAX
 
 # ✅ achievements metrics
 from services.achievements.metrics import inc_metric, try_mark_event_once
+
+from models.player import PlayerDTO
+from routers.auth import get_player  # ✅ initData -> PlayerDTO
 
 router = APIRouter(prefix="/api", tags=["city"])
 
@@ -32,7 +35,7 @@ class DailyLoginDTO(BaseModel):
     got_kleynod: bool
 
 
-class PlayerDTO(BaseModel):
+class PlayerOutDTO(BaseModel):
     tg_id: int
     name: str
 
@@ -60,18 +63,28 @@ class PlayerDTO(BaseModel):
 
 class CityEntryResponse(BaseModel):
     ok: bool
-    player: PlayerDTO
+    player: PlayerOutDTO
     entry: Optional[EntryDTO] = None
     daily_login: Optional[DailyLoginDTO] = None
 
 
 def _today_utc_key() -> str:
-    # стабільний ключ дня (UTC), щоб не накручувалось
     return datetime.now(timezone.utc).date().isoformat()  # YYYY-MM-DD
 
 
 @router.get("/city-entry", response_model=CityEntryResponse)
-async def city_entry(tg_id: int) -> CityEntryResponse:
+async def city_entry(player: PlayerDTO = Depends(get_player)) -> CityEntryResponse:
+    tg_id = int(player.tg_id)
+
+    pool = await get_pool()
+    await _ensure_player_progress_schema()
+
+    # ✅ гравець має існувати (інакше registration/auth ще не створили рядок)
+    async with pool.acquire() as conn:
+        exists = await conn.fetchval("SELECT 1 FROM players WHERE tg_id=$1", tg_id)
+    if not exists:
+        raise HTTPException(403, "PLAYER_NOT_REGISTERED")
+
     # 1) реген
     regen = None
     try:
@@ -80,17 +93,7 @@ async def city_entry(tg_id: int) -> CityEntryResponse:
         logger.warning(f"city_entry: apply_full_regen fail tg_id={tg_id}: {e}")
         regen = None
 
-    pool = await get_pool()
-    await _ensure_player_progress_schema()
-
-    # ✅ спершу перевірка існування гравця (реєстрацію не ламає)
-    async with pool.acquire() as conn:
-        exists = await conn.fetchval("SELECT 1 FROM players WHERE tg_id=$1", tg_id)
-    if not exists:
-        raise HTTPException(404, "PLAYER_NOT_FOUND")
-
-    # ✅ achievements: 1 раз на добу інкрементимо login_days_total
-    # event_key робимо стабільним: login_day:2026-01-10
+    # ✅ achievements: 1 раз на добу
     try:
         day_key = _today_utc_key()
         event_key = f"login_day:{day_key}"
@@ -100,7 +103,7 @@ async def city_entry(tg_id: int) -> CityEntryResponse:
     except Exception as e:
         logger.warning(f"city_entry: achievements login_days_total fail tg_id={tg_id}: {e}")
 
-    # ✅ 2) daily login ДО читання профілю
+    # ✅ 2) daily login
     daily_login: Optional[DailyLoginDTO] = None
     try:
         from services.daily_login import process_daily_login  # type: ignore
@@ -116,7 +119,7 @@ async def city_entry(tg_id: int) -> CityEntryResponse:
         logger.warning(f"city_entry: process_daily_login fail tg_id={tg_id}: {e}")
         daily_login = None
 
-    # 3) тепер читаємо профіль (вже актуальний)
+    # 3) читаємо гравця
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
@@ -141,7 +144,7 @@ async def city_entry(tg_id: int) -> CityEntryResponse:
         )
 
     if not row:
-        raise HTTPException(404, "PLAYER_NOT_FOUND")
+        raise HTTPException(403, "PLAYER_NOT_REGISTERED")
 
     level = int(row["level"])
     xp = int(row["xp"])
@@ -186,9 +189,13 @@ async def city_entry(tg_id: int) -> CityEntryResponse:
             regen_energy = 0
 
         if regen_hp > 0 or regen_mp > 0 or regen_energy > 0:
-            entry = EntryDTO(regen_hp=regen_hp, regen_mp=regen_mp, regen_energy=regen_energy)
+            entry = EntryDTO(
+                regen_hp=regen_hp,
+                regen_mp=regen_mp,
+                regen_energy=regen_energy,
+            )
 
-    player_dto = PlayerDTO(
+    player_dto = PlayerOutDTO(
         tg_id=int(row["tg_id"]),
         name=row["name"] or "",
         level=level,
