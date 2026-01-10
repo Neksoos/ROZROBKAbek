@@ -1,6 +1,7 @@
+# routers/forum.py
 from __future__ import annotations
 
-from typing import List, Optional, Dict, Any, Tuple
+from typing import List, Optional, Dict, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Header, Query, Path
 from pydantic import BaseModel, Field
@@ -28,6 +29,15 @@ async def get_tg_id(
         return v
     except Exception:
         raise HTTPException(status_code=401, detail="Invalid X-Tg-Id")
+
+
+# ─────────────────────────────────────────────
+# Forum settings
+# ─────────────────────────────────────────────
+FORUM_CAT_COST = {"chervontsi": 1000, "kleynody": 10}
+FORUM_CAT_MIN_LEVEL = 3
+FORUM_CAT_COOLDOWN_HOURS = 24
+FORUM_CAT_MAX_PER_30D = 3
 
 
 # ─────────────────────────────────────────────
@@ -111,13 +121,28 @@ class PostCreateRequest(BaseModel):
     reply_to_post_id: Optional[int] = Field(default=None, ge=1)
 
 
-# ✅ ЛИШЕ "подяки"
 class PostLikeResponse(BaseModel):
     ok: bool = True
     likes_cnt: int
     liked: bool
 
 
+class CategoryCreatePaidRequest(BaseModel):
+    title: str = Field(..., min_length=3, max_length=60)
+    description: str = Field(default="", max_length=400)
+    pay_currency: str = Field(..., pattern="^(chervontsi|kleynody)$")
+
+
+class CategoryCreatePaidResponse(BaseModel):
+    ok: bool = True
+    category: CategoryDTO
+    paid_currency: str
+    paid_amount: int
+
+
+# ─────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────
 def _norm_pagination(page: int, per_page: int) -> tuple[int, int]:
     if page < 1:
         page = 1
@@ -157,6 +182,25 @@ def _snippet(s: str, n: int = 80) -> str:
     return s[: n - 1] + "…"
 
 
+def _make_slug(title: str) -> str:
+    # простий slugger без залежностей: лат/цифри/дефіс
+    s = (title or "").strip().lower()
+    out = []
+    prev_dash = False
+    for ch in s:
+        if ch.isalnum():
+            out.append(ch)
+            prev_dash = False
+        elif ch in (" ", "_", "-", ".", "/"):
+            if not prev_dash:
+                out.append("-")
+                prev_dash = True
+    slug = "".join(out).strip("-")
+    if not slug:
+        slug = "category"
+    return slug[:48]
+
+
 async def _send_forum_reply_mail(
     conn,
     *,
@@ -167,9 +211,6 @@ async def _send_forum_reply_mail(
     topic_title: str,
     reply_text: str,
 ) -> None:
-    """
-    Safe insert into mail_messages with fallback for different schemas.
-    """
     if recipient_tg <= 0 or recipient_tg == sender_tg:
         return
 
@@ -180,7 +221,7 @@ async def _send_forum_reply_mail(
         f"{_snippet(reply_text, 400)}"
     )
 
-    # try schema A
+    # schema A
     try:
         await conn.execute(
             """
@@ -196,7 +237,7 @@ async def _send_forum_reply_mail(
     except Exception:
         pass
 
-    # try schema B (older / mixed columns seen in your screenshots)
+    # schema B
     try:
         await conn.execute(
             """
@@ -211,7 +252,6 @@ async def _send_forum_reply_mail(
         )
         return
     except Exception:
-        # don't break forum posting because of mail
         return
 
 
@@ -231,6 +271,125 @@ async def list_categories():
             """
         )
         return [CategoryDTO(**dict(r)) for r in (rows or [])]
+
+
+@router.post("/categories/create-paid", response_model=CategoryCreatePaidResponse)
+async def create_category_paid(payload: CategoryCreatePaidRequest, me: int = Depends(get_tg_id)):
+    title = payload.title.strip()
+    pay_currency = payload.pay_currency
+    pay_amount = int(FORUM_CAT_COST[pay_currency])
+
+    slug = _make_slug(title)
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        # 1) мін рівень
+        prow = await conn.fetchrow("SELECT COALESCE(level,1) AS level FROM players WHERE tg_id=$1", me)
+        lvl = int(prow["level"] if prow else 1)
+        if lvl < FORUM_CAT_MIN_LEVEL:
+            raise HTTPException(403, detail=f"MIN_LEVEL_{FORUM_CAT_MIN_LEVEL}")
+
+        # 2) кулдаун
+        recent = await conn.fetchval(
+            """
+            SELECT 1
+            FROM forum_category_creations
+            WHERE creator_tg=$1 AND created_at > now() - ($2::interval)
+            LIMIT 1
+            """,
+            me,
+            f"{FORUM_CAT_COOLDOWN_HOURS} hours",
+        )
+        if recent:
+            raise HTTPException(429, detail="CATEGORY_CREATE_COOLDOWN")
+
+        # 3) ліміт 30 днів
+        cnt30 = await conn.fetchval(
+            """
+            SELECT COUNT(1)
+            FROM forum_category_creations
+            WHERE creator_tg=$1 AND created_at > now() - interval '30 days'
+            """,
+            me,
+        )
+        if int(cnt30 or 0) >= FORUM_CAT_MAX_PER_30D:
+            raise HTTPException(429, detail="CATEGORY_CREATE_LIMIT_30D")
+
+        # 4) slug зайнятий?
+        exists = await conn.fetchval(
+            "SELECT 1 FROM forum_categories WHERE lower(slug)=lower($1) LIMIT 1",
+            slug,
+        )
+        if exists:
+            raise HTTPException(400, detail="SLUG_TAKEN")
+
+        # 5) транзакція: списання + створення
+        async with conn.transaction():
+            bal = await conn.fetchrow(
+                "SELECT chervontsi, kleynody FROM players WHERE tg_id=$1 FOR UPDATE",
+                me,
+            )
+            if not bal:
+                raise HTTPException(404, detail="PLAYER_NOT_FOUND")
+
+            have_ch = int(bal["chervontsi"] or 0)
+            have_kl = int(bal["kleynody"] or 0)
+
+            if pay_currency == "chervontsi" and have_ch < pay_amount:
+                raise HTTPException(400, detail="NOT_ENOUGH_CHERVONTSI")
+            if pay_currency == "kleynody" and have_kl < pay_amount:
+                raise HTTPException(400, detail="NOT_ENOUGH_KLEYNODY")
+
+            if pay_currency == "chervontsi":
+                await conn.execute(
+                    "UPDATE players SET chervontsi = chervontsi - $2 WHERE tg_id=$1",
+                    me,
+                    pay_amount,
+                )
+            else:
+                await conn.execute(
+                    "UPDATE players SET kleynody = kleynody - $2 WHERE tg_id=$1",
+                    me,
+                    pay_amount,
+                )
+
+            max_sort = await conn.fetchval("SELECT COALESCE(MAX(sort_order),0) FROM forum_categories")
+            sort_order = int(max_sort or 0) + 1
+
+            crow = await conn.fetchrow(
+                """
+                INSERT INTO forum_categories(slug, title, sort_order, is_hidden, created_by_tg)
+                VALUES ($1, $2, $3, FALSE, $4)
+                RETURNING id, slug, title, sort_order
+                """,
+                slug,
+                title,
+                sort_order,
+                me,
+            )
+            cat_id = int(crow["id"])
+
+            await conn.execute(
+                """
+                INSERT INTO forum_category_creations(creator_tg, category_id, pay_currency, pay_amount)
+                VALUES ($1, $2, $3, $4)
+                """,
+                me,
+                cat_id,
+                pay_currency,
+                pay_amount,
+            )
+
+        return CategoryCreatePaidResponse(
+            category=CategoryDTO(
+                id=int(crow["id"]),
+                slug=str(crow["slug"]),
+                title=str(crow["title"]),
+                sort_order=int(crow["sort_order"]),
+            ),
+            paid_currency=pay_currency,
+            paid_amount=pay_amount,
+        )
 
 
 # ─────────────────────────────────────────────
@@ -542,7 +701,6 @@ async def create_post(
 
         reply_target: Optional[Dict[str, Any]] = None
         if reply_to_post_id:
-            # reply target must exist and belong to same topic
             rrow = await conn.fetchrow(
                 """
                 SELECT fp.id, fp.topic_id, fp.author_tg, COALESCE(p.name,'') AS author_name, fp.body
@@ -589,7 +747,6 @@ async def create_post(
                 topic_id,
             )
 
-            # ✅ Mail notification (inside same conn, but we ignore failures inside helper)
             if reply_target:
                 await _send_forum_reply_mail(
                     conn,
@@ -619,7 +776,7 @@ async def create_post(
 
 
 # ─────────────────────────────────────────────
-# ✅ ЛИШЕ "подяки": toggle like
+# Toggle like (подяка)
 # ─────────────────────────────────────────────
 @router.post("/posts/{post_id}/like", response_model=PostLikeResponse)
 async def toggle_post_like(
