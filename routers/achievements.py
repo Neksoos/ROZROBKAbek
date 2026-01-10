@@ -1,6 +1,7 @@
 # routers/achievements.py
 from __future__ import annotations
 
+import json
 from typing import Any, Dict, List, Optional, Set, Tuple
 from datetime import datetime, timezone
 
@@ -206,9 +207,44 @@ async def seed_achievements_if_empty() -> None:
 # helpers
 # ─────────────────────────────────────────────
 
+def _coerce_tiers(raw: Any) -> List[Dict[str, Any]]:
+    """
+    Буває що стара таблиця зберігає tiers як TEXT з JSON.
+    Тоді asyncpg повертає str, і list(str) ламає все.
+    Тут приводимо до list[dict].
+    """
+    if raw is None:
+        return []
+
+    # якщо в БД tiers зберігся як JSON-рядок
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except Exception:
+            return []
+
+    if isinstance(raw, list):
+        out: List[Dict[str, Any]] = []
+        for x in raw:
+            if isinstance(x, str):
+                try:
+                    x = json.loads(x)
+                except Exception:
+                    continue
+            if isinstance(x, dict):
+                out.append(x)
+        return out
+
+    return []
+
+
 async def get_metric_val(conn: Any, tg_id: int, key: str) -> int:
     # ✅ у вашій схемі це val, не value
-    v = await conn.fetchval("SELECT COALESCE(val,0)::bigint FROM player_metrics WHERE tg_id=$1 AND key=$2", tg_id, key)
+    v = await conn.fetchval(
+        "SELECT COALESCE(val,0)::bigint FROM player_metrics WHERE tg_id=$1 AND key=$2",
+        tg_id,
+        key,
+    )
     return int(v or 0)
 
 
@@ -221,11 +257,16 @@ async def get_claimed_set(conn: Any, tg_id: int) -> Set[Tuple[str, int]]:
 
 
 def _parse_reward(d: Dict[str, Any]) -> RewardDTO:
+    if isinstance(d, str):
+        try:
+            d = dict(json.loads(d))
+        except Exception:
+            d = {}
     return RewardDTO(
-        chervontsi=int(d.get("chervontsi") or 0),
-        kleynody=int(d.get("kleynody") or 0),
-        badge=d.get("badge"),
-        title=d.get("title"),
+        chervontsi=int((d or {}).get("chervontsi") or 0),
+        kleynody=int((d or {}).get("kleynody") or 0),
+        badge=(d or {}).get("badge"),
+        title=(d or {}).get("title"),
     )
 
 
@@ -250,7 +291,7 @@ async def defs() -> AchDefsResponse:
 
     out: List[AchievementDTO] = []
     for r in rows:
-        tiers_raw = list(r["tiers"] or [])
+        tiers_raw = _coerce_tiers(r["tiers"])
         tiers: List[TierDTO] = []
         for t in tiers_raw:
             tiers.append(
@@ -306,8 +347,8 @@ async def status(request: Request) -> List[AchievementStatusDTO]:
         code = str(a["code"])
         key = str(a["metric_key"])
         cur = int(metric_map.get(key, 0))
-        tiers_raw = list(a["tiers"] or [])
 
+        tiers_raw = _coerce_tiers(a["tiers"])
         tiers: List[TierStatusDTO] = []
         for t in tiers_raw:
             tier_n = int(t.get("tier"))
@@ -381,8 +422,8 @@ async def claim(request: Request, body: ClaimBody) -> ClaimResponse:
                 metric_key = str(a["metric_key"])
                 cur = await get_metric_val(conn, tg_id, metric_key)
 
-                tiers_raw = list(a["tiers"] or [])
-                tier_obj = None
+                tiers_raw = _coerce_tiers(a["tiers"])
+                tier_obj: Optional[Dict[str, Any]] = None
                 for t in tiers_raw:
                     if int(t.get("tier")) == int(body.tier):
                         tier_obj = t
@@ -392,7 +433,10 @@ async def claim(request: Request, body: ClaimBody) -> ClaimResponse:
 
                 target = int(tier_obj.get("target"))
                 if cur < target:
-                    raise HTTPException(400, detail={"code": "NOT_ACHIEVED", "current": cur, "target": target})
+                    raise HTTPException(
+                        400,
+                        detail={"code": "NOT_ACHIEVED", "current": cur, "target": target},
+                    )
 
                 reward = _parse_reward(dict(tier_obj.get("reward") or {}))
 
@@ -432,9 +476,15 @@ async def claim(request: Request, body: ClaimBody) -> ClaimResponse:
             try:
                 await add_kleynody(tg_id, kleynody_to_add)
             except Exception:
-                logger.exception("achievement: add_kleynody FAILED tg_id={} n={}", tg_id, kleynody_to_add)
+                logger.exception(
+                    "achievement: add_kleynody FAILED tg_id={} n={}",
+                    tg_id,
+                    kleynody_to_add,
+                )
                 # не падаємо — claim уже записаний
         else:
-            logger.warning("achievement: kleynody reward requested but services.wallet.add_kleynody is missing")
+            logger.warning(
+                "achievement: kleynody reward requested but services.wallet.add_kleynody is missing"
+            )
 
     return ClaimResponse(ok=True, achievement_code=body.achievement_code, tier=int(body.tier), granted=reward)
