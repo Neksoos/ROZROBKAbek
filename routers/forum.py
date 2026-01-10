@@ -1,7 +1,6 @@
 # routers/forum.py
 from __future__ import annotations
 
-from datetime import timedelta
 from typing import List, Optional, Dict, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Header, Query, Path
@@ -211,8 +210,28 @@ def _make_slug(title: str) -> str:
             continue
 
         if ch.isspace() or ch in (
-            "_", ".", ",", ":", ";", "!", "?", "/", "\\", "|", "+", "=", "(",
-            ")", "[", "]", "{", "}", '"', "'", "«", "»"
+            "_",
+            ".",
+            ",",
+            ":",
+            ";",
+            "!",
+            "?",
+            "/",
+            "\\",
+            "|",
+            "+",
+            "=",
+            "(",
+            ")",
+            "[",
+            "]",
+            "{",
+            "}",
+            '"',
+            "'",
+            "«",
+            "»",
         ):
             if not prev_dash and out:
                 out.append("-")
@@ -249,6 +268,7 @@ async def _send_forum_reply_mail(
         f"{_snippet(reply_text, 400)}"
     )
 
+    # schema A
     try:
         await conn.execute(
             """
@@ -264,6 +284,7 @@ async def _send_forum_reply_mail(
     except Exception:
         pass
 
+    # schema B
     try:
         await conn.execute(
             """
@@ -315,17 +336,17 @@ async def create_category_paid(payload: CategoryCreatePaidRequest, me: int = Dep
         if lvl < FORUM_CAT_MIN_LEVEL:
             raise HTTPException(403, detail=f"MIN_LEVEL_{FORUM_CAT_MIN_LEVEL}")
 
-        # 2) ✅ кулдаун (FIX: interval параметр має бути timedelta, не str)
+        # 2) кулдаун (✅ FIX: будуємо interval з числа годин)
         recent = await conn.fetchval(
             """
             SELECT 1
             FROM forum_category_creations
             WHERE creator_tg=$1
-              AND created_at > now() - $2
+              AND created_at > (now() - ($2 * interval '1 hour'))
             LIMIT 1
             """,
             me,
-            timedelta(hours=FORUM_CAT_COOLDOWN_HOURS),
+            int(FORUM_CAT_COOLDOWN_HOURS),
         )
         if recent:
             raise HTTPException(429, detail="CATEGORY_CREATE_COOLDOWN")
@@ -394,9 +415,6 @@ async def create_category_paid(payload: CategoryCreatePaidRequest, me: int = Dep
                 sort_order,
                 me,
             )
-            if not crow:
-                raise HTTPException(status_code=500, detail="CATEGORY_CREATE_FAILED")
-
             cat_id = int(crow["id"])
 
             await conn.execute(
@@ -429,7 +447,7 @@ async def create_category_paid(payload: CategoryCreatePaidRequest, me: int = Dep
 async def list_topics(
     me: int = Depends(get_tg_id),
     category_id: Optional[int] = Query(default=None),
-    order: str = Query(default="hot"),  # hot | new | mine
+    order: str = Query(default="hot"),
     page: int = Query(default=1, ge=1),
     per_page: int = Query(default=20, ge=1, le=50),
 ):
