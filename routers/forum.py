@@ -182,22 +182,55 @@ def _snippet(s: str, n: int = 80) -> str:
     return s[: n - 1] + "…"
 
 
+def _is_ua_letter(ch: str) -> bool:
+    # UA + базова кирилиця (щоб не відрізати “ґ/є/і/ї”)
+    return (
+        ("а" <= ch <= "я")
+        or ch in ("ґ", "є", "і", "ї", "ь")
+        or ("А" <= ch <= "Я")
+        or ch in ("Ґ", "Є", "І", "Ї", "Ь")
+    )
+
+
 def _make_slug(title: str) -> str:
-    # простий slugger без залежностей: лат/цифри/дефіс
+    """
+    Кириличний slug: лишаємо українські/кириличні літери, латиницю, цифри.
+    Розділювач — дефіс. Все інше -> дефіс, подвійні дефіси стискаємо.
+    """
     s = (title or "").strip().lower()
-    out = []
+
+    out: list[str] = []
     prev_dash = False
+
     for ch in s:
-        if ch.isalnum():
+        if ch.isdigit() or ("a" <= ch <= "z") or _is_ua_letter(ch):
             out.append(ch)
             prev_dash = False
-        elif ch in (" ", "_", "-", ".", "/"):
-            if not prev_dash:
+            continue
+
+        # дозволимо дефіс як є
+        if ch == "-":
+            if not prev_dash and out:
                 out.append("-")
                 prev_dash = True
+            continue
+
+        # пробіли/пунктуація/підкреслення -> дефіс
+        if ch.isspace() or ch in ("_", ".", ",", ":", ";", "!", "?", "/", "\\", "|", "+", "=", "(", ")", "[", "]", "{", "}", '"', "'", "«", "»"):
+            if not prev_dash and out:
+                out.append("-")
+                prev_dash = True
+            continue
+
+        # інші символи (emoji тощо) — просто пропускаємо або замінюємо на дефіс,
+        # але без спаму дефісами
+        if not prev_dash and out:
+            out.append("-")
+            prev_dash = True
+
     slug = "".join(out).strip("-")
     if not slug:
-        slug = "category"
+        slug = "категорія"
     return slug[:48]
 
 
