@@ -1,3 +1,5 @@
+-- migrations/xxx_achievements.sql (або як ти назвав)
+
 CREATE TABLE IF NOT EXISTS player_metrics (
   tg_id  bigint NOT NULL,
   key    text   NOT NULL,
@@ -12,3 +14,7 @@ CREATE TABLE IF NOT EXISTS player_events (
   created_at timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (tg_id, event_key)
 );
+
+-- (опційно, але корисно для адмінки/статистики/ачівок)
+CREATE INDEX IF NOT EXISTS idx_player_metrics_key ON player_metrics(key);
+CREATE INDEX IF NOT EXISTS idx_player_events_event_key ON player_events(event_key);
