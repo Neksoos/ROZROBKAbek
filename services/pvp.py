@@ -99,6 +99,20 @@ async def _mark_duel_finished_in_db(duel_id: int) -> None:
         logger.warning(f"pvp: failed to mark duel finished in DB: {e}")
 
 
+async def _record_elo_if_finished(st: Dict[str, Any]) -> None:
+    """
+    ✅ Запис ELO після завершення дуелі.
+    """
+    try:
+        w = int(st.get("winner") or 0)
+        l = int(st.get("loser") or 0)
+        if w > 0 and l > 0 and w != l:
+            from .perun_elo import record_duel_result as _rec  # type: ignore
+            await _rec(w, l)
+    except Exception as e:
+        logger.warning(f"pvp: record elo failed: {e}")
+
+
 # ============================================================
 # PUBLIC API (NO TELEGRAM)
 # ============================================================
@@ -219,6 +233,7 @@ async def attack(actor_id: int, duel_id: int) -> Dict[str, Any]:
             st["loser"] = int(st["p2"]) if st["winner"] == int(st["p1"]) else int(st["p1"])
             await pvp_rt.save_state(duel_id, st)
             await _mark_duel_finished_in_db(duel_id)
+            await _record_elo_if_finished(st)
             return {"ok": True, "event": "finished", "state": st}
 
         st["turn"] = next_turn
@@ -287,6 +302,7 @@ async def surrender(actor_id: int, duel_id: int) -> Dict[str, Any]:
 
     await pvp_rt.save_state(duel_id, st)
     await _mark_duel_finished_in_db(duel_id)
+    await _record_elo_if_finished(st)
     return {"ok": True, "event": "finished", "state": st}
 
 
