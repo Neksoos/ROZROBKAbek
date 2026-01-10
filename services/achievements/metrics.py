@@ -1,21 +1,21 @@
 # services/achievements/metrics.py
 from __future__ import annotations
 
-from typing import Optional
 from db import get_pool
 
 
 async def inc_metric(tg_id: int, key: str, delta: int = 1) -> None:
     if tg_id <= 0 or not key:
         return
+
     pool = await get_pool()
     async with pool.acquire() as conn:
         await conn.execute(
             """
-            INSERT INTO player_metrics(tg_id, key, value)
+            INSERT INTO player_metrics(tg_id, key, val)
             VALUES($1,$2,$3)
             ON CONFLICT (tg_id, key)
-            DO UPDATE SET value = player_metrics.value + EXCLUDED.value,
+            DO UPDATE SET val = player_metrics.val + EXCLUDED.val,
                           updated_at = now()
             """,
             tg_id,
@@ -27,14 +27,15 @@ async def inc_metric(tg_id: int, key: str, delta: int = 1) -> None:
 async def set_metric_max(tg_id: int, key: str, value: int) -> None:
     if tg_id <= 0 or not key:
         return
+
     pool = await get_pool()
     async with pool.acquire() as conn:
         await conn.execute(
             """
-            INSERT INTO player_metrics(tg_id, key, value)
+            INSERT INTO player_metrics(tg_id, key, val)
             VALUES($1,$2,$3)
             ON CONFLICT (tg_id, key)
-            DO UPDATE SET value = GREATEST(player_metrics.value, EXCLUDED.value),
+            DO UPDATE SET val = GREATEST(player_metrics.val, EXCLUDED.val),
                           updated_at = now()
             """,
             tg_id,
@@ -46,10 +47,11 @@ async def set_metric_max(tg_id: int, key: str, value: int) -> None:
 async def get_metric(tg_id: int, key: str) -> int:
     if tg_id <= 0 or not key:
         return 0
+
     pool = await get_pool()
     async with pool.acquire() as conn:
         v = await conn.fetchval(
-            "SELECT COALESCE(value, 0)::bigint FROM player_metrics WHERE tg_id=$1 AND key=$2",
+            "SELECT COALESCE(val, 0)::bigint FROM player_metrics WHERE tg_id=$1 AND key=$2",
             tg_id,
             key,
         )
@@ -58,8 +60,8 @@ async def get_metric(tg_id: int, key: str) -> int:
 
 async def try_mark_event_once(tg_id: int, event_key: str) -> bool:
     """
-    Ідемпотентність: повертає True тільки якщо подія записалась ВПЕРШЕ.
-    Вимагає таблицю player_events(tg_id, event_key).
+    Ідемпотентність: True тільки якщо подія записалась вперше.
+    Використовує player_events(tg_id, event_key).
     """
     if tg_id <= 0 or not event_key:
         return False
