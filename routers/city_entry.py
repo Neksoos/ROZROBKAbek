@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from typing import Optional
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
@@ -12,6 +13,9 @@ from services.regeneration import apply_full_regen
 from services.progress import xp_required_for, _ensure_player_progress_schema
 from services.char_stats import get_full_stats_for_player
 from services.energy import BASE_ENERGY_MAX
+
+# ✅ achievements metrics
+from services.achievements.metrics import inc_metric, try_mark_event_once
 
 router = APIRouter(prefix="/api", tags=["city"])
 
@@ -61,6 +65,11 @@ class CityEntryResponse(BaseModel):
     daily_login: Optional[DailyLoginDTO] = None
 
 
+def _today_utc_key() -> str:
+    # стабільний ключ дня (UTC), щоб не накручувалось
+    return datetime.now(timezone.utc).date().isoformat()  # YYYY-MM-DD
+
+
 @router.get("/city-entry", response_model=CityEntryResponse)
 async def city_entry(tg_id: int) -> CityEntryResponse:
     # 1) реген
@@ -79,6 +88,17 @@ async def city_entry(tg_id: int) -> CityEntryResponse:
         exists = await conn.fetchval("SELECT 1 FROM players WHERE tg_id=$1", tg_id)
     if not exists:
         raise HTTPException(404, "PLAYER_NOT_FOUND")
+
+    # ✅ achievements: 1 раз на добу інкрементимо login_days_total
+    # event_key робимо стабільним: login_day:2026-01-10
+    try:
+        day_key = _today_utc_key()
+        event_key = f"login_day:{day_key}"
+        first_today = await try_mark_event_once(tg_id, event_key)
+        if first_today:
+            await inc_metric(tg_id, "login_days_total", 1)
+    except Exception as e:
+        logger.warning(f"city_entry: achievements login_days_total fail tg_id={tg_id}: {e}")
 
     # ✅ 2) daily login ДО читання профілю
     daily_login: Optional[DailyLoginDTO] = None
