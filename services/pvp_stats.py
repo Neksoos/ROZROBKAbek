@@ -4,18 +4,13 @@ from __future__ import annotations
 from typing import List, Dict, Optional
 from loguru import logger
 
-# ---- DB --------------------------------------------------------------
-# Підтримуємо обидва варіанти імпорту (у тебе в різних файлах по-різному)
+# ✅ ЄДИНИЙ правильний pool
 try:
-    from ..database import get_pool  # type: ignore
+    from db import get_pool  # type: ignore
 except Exception:
-    try:
-        from database import get_pool  # type: ignore
-    except Exception:
-        get_pool = None  # type: ignore
+    get_pool = None  # type: ignore
 
 # ---- Single source of truth for ELO ---------------------------------
-# Використовуємо один сервіс ELO, а не 3 різні реалізації
 try:
     from .perun_elo import ensure_schema, reset_period, top, get_player_elo  # type: ignore
 except Exception:
@@ -49,7 +44,7 @@ async def record_duel_result(winner_id: int, loser_id: int) -> bool:
     """
     try:
         from .perun_elo import record_duel_result as _rec  # type: ignore
-        await _rec(winner_id, loser_id)
+        await _rec(int(winner_id), int(loser_id))
         return True
     except Exception as e:
         logger.warning(f"pvp_stats.record_duel_result failed: {e}")
@@ -125,7 +120,6 @@ async def get_top(scope: str, limit: int = 10) -> List[Dict]:
 
         pool = await get_pool()
         async with pool.acquire() as conn:
-            # мапа tg_id -> (name, level)
             people = await conn.fetch(
                 """
                 SELECT tg_id, COALESCE(name,'Герой') AS name, COALESCE(level,1) AS level
