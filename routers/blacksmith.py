@@ -19,6 +19,9 @@ from services.inventory.migrations import (
     ensure_player_inventory_columns as _ensure_player_inventory_columns,
 )
 
+# ✅ achievements (метрики)
+from services.achievements.metrics import inc_metric  # type: ignore
+
 router = APIRouter(prefix="/api/blacksmith", tags=["blacksmith"])
 
 
@@ -535,6 +538,12 @@ async def smelt_start(tg_id: int, body: SmeltStartBody) -> SmeltStartResponse:
         slot=meta["slot"],
     )
 
+    # ✅ achievements: плавка теж може бути метрикою (окремо від крафту)
+    try:
+        await inc_metric(tg_id, "smelt_blacksmith_count", 1)
+    except Exception:
+        logger.exception("blacksmith: inc_metric smelt_blacksmith_count FAILED tg_id={}", tg_id)
+
     return SmeltStartResponse(ok=True, recipe_code=body.recipe_code, item_code=item_code, amount=amount)
 
 
@@ -826,5 +835,12 @@ async def forge_claim(tg_id: int, body: ForgeClaimBody) -> ForgeClaimResponse:
         qty=amount,
         slot=meta["slot"],
     )
+
+    # ✅ achievements: це і є "крафт у коваля"
+    # рахуємо по 1 за один claim (або можна по amount, якщо є рецепти з output_amount>1)
+    try:
+        await inc_metric(tg_id, "craft_blacksmith_count", 1)
+    except Exception:
+        logger.exception("blacksmith: inc_metric craft_blacksmith_count FAILED tg_id={}", tg_id)
 
     return ForgeClaimResponse(ok=True, item_code=item_code, amount=amount)
