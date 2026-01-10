@@ -41,6 +41,8 @@ from routers.blacksmith import router as blacksmith_router  # ✅ NEW
 
 from routers.craft_materials import router as craft_materials_router  # ✅ NEW
 
+from routers.achievements import router as achievements_router  # ✅ NEW (ACHIEVEMENTS)
+
 from routers.mail import router as mail_router
 from routers.night_watch_api import router as night_watch_router
 from routers.npc_router import router as npc_router
@@ -250,6 +252,8 @@ app.include_router(inventory_router)
 app.include_router(materials_router)
 app.include_router(alchemy_router)
 app.include_router(blacksmith_router)  # ✅ NEW
+
+app.include_router(achievements_router)  # ✅ NEW (ACHIEVEMENTS)
 
 app.include_router(craft_materials_router, prefix="/api")  # ✅ NEW
 
