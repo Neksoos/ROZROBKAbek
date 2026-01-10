@@ -1,220 +1,162 @@
-# services/battle/rewards.py
+# services/achievements/service.py
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Dict, List, Optional, Set
 
 from loguru import logger
 
 from db import get_pool
 
-from services.progress import grant_xp_for_win  # type: ignore
-from services.fort_levels import add_fort_xp_for_kill  # type: ignore
-from services.rewards import distribute_drops
-from services.loot import get_loot_for_mob  # type: ignore
+from services.achievements.catalog import AchievementDef, achievements_by_metric
 
-from services.battle.models import Mob
-
-from services.achievements.metrics import inc_metric, try_mark_event_once  # ✅ metrics + idempotency
-from services.achievements.service import check_and_grant  # ✅ unlock + rewards + messages
-
+# ✅ клейноди (опційно): якщо є сервіс гаманця — додаємо після транзакції
 try:
-    from services.night_watch import roll_medal, report_kill  # type: ignore
+    from services.wallet import add_kleynody  # type: ignore
 except Exception:
-
-    def roll_medal(_lvl: int, _rng=None) -> bool:  # type: ignore
-        return False
-
-    async def report_kill(_tg_id: int, _lvl: int, _hp: int, _medal: bool) -> None:  # type: ignore
-        return None
+    add_kleynody = None  # type: ignore
 
 
-async def reward_items_new(tg_id: int, mob: Mob) -> List[str]:
-    try:
-        loot_items = await get_loot_for_mob(mob.code)
-        logger.info("loot: mob={} lvl={} result={}", mob.code, mob.level, loot_items)
-    except Exception:
-        logger.exception("loot: get_loot_for_mob FAILED tg_id={} mob_code={}", tg_id, mob.code)
-        return []
-
-    if not loot_items:
-        return []
-
-    try:
-        return await distribute_drops(tg_id, loot_items)
-    except Exception:
-        logger.exception("loot: distribute_drops FAILED tg_id={} loot={}", tg_id, loot_items)
-        return []
+def _event_key_for_achv(achv_key: str) -> str:
+    return f"achv:{achv_key}"
 
 
-def _normalize_area_for_metric(area: Optional[str]) -> str:
-    a = (area or "unknown").strip().lower()
-    if not a:
-        a = "unknown"
-    return a
+def _format_unlock_message(a: AchievementDef) -> str:
+    parts = [f"🏆 Досягнення: {a.name}"]
+    if a.reward.coins:
+        parts.append(f"💰 +{int(a.reward.coins)} червонців")
+    if a.reward.kleynody:
+        parts.append(f"💠 +{int(a.reward.kleynody)} клейнодів")
+    return " • ".join(parts)
 
 
-async def _apply_win_metrics(tg_id: int, mob: Mob) -> None:
+async def _get_metrics_map(conn, tg_id: int) -> Dict[str, int]:
+    rows = await conn.fetch(
+        "SELECT key, COALESCE(val,0)::bigint AS val FROM player_metrics WHERE tg_id=$1",
+        tg_id,
+    )
+    out: Dict[str, int] = {}
+    for r in rows or []:
+        out[str(r["key"])] = int(r["val"] or 0)
+    return out
+
+
+async def _try_mark_event_once_tx(conn, tg_id: int, event_key: str) -> bool:
     """
-    Лічильники під ачівки. Тут тільки "метрики", без нагород.
+    player_events: (tg_id, event_key) PRIMARY KEY
+    ✅ True якщо це перший раз
+    ❌ False якщо вже було
     """
-    # загальні
-    await inc_metric(tg_id, "battles_total", 1)
-    await inc_metric(tg_id, "battles_won", 1)
-    await inc_metric(tg_id, "kills_total", 1)
-
-    # по мобу
-    await inc_metric(tg_id, f"kills_{mob.code}", 1)
-
-    # по рівню моба (корисно для ачівок типу "вбий 100 мобів 10+")
-    await inc_metric(tg_id, "kills_lvl_sum", int(mob.level or 1))
-    await inc_metric(tg_id, f"kills_lvl_{int(mob.level or 1):02d}", 1)
-
-    # по зоні (якщо mob має поле area)
-    area = _normalize_area_for_metric(getattr(mob, "area", None))
-    await inc_metric(tg_id, f"wins_area_{area}", 1)
+    row = await conn.fetchrow(
+        """
+        INSERT INTO player_events(tg_id, event_key)
+        VALUES($1,$2)
+        ON CONFLICT (tg_id, event_key) DO NOTHING
+        RETURNING tg_id
+        """,
+        tg_id,
+        event_key,
+    )
+    return row is not None
 
 
-async def reward_for_win(tg_id: int, mob: Mob, battle_id: Optional[int] = None) -> List[str]:
+async def _grant_reward_tx(conn, tg_id: int, coins: int) -> None:
     """
-    Видає нагороди за перемогу.
-    ✅ Метрики для ачівок.
-    ✅ Ідемпотентність якщо передано battle_id (РЕКОМЕНДОВАНО).
-    ✅ Повертає рядки лута + рядки "🏆 Досягнення..." (якщо відкрились).
+    Видача монет в межах транзакції.
+    Клейноди — окремо після commit (може бути інший пул/сервіс).
     """
-    loot: List[str] = []
-
-    # ----------------------------
-    # ✅ ІДЕМПОТЕНТНІСТЬ
-    # ----------------------------
-    if battle_id is not None:
-        event_key = f"battle_win_reward:{int(battle_id)}"
-        first = await try_mark_event_once(tg_id, event_key)
-        if not first:
-            return ["Нагорода вже видана."]
-
-    # ----------------------------
-    # ✅ АЧІВКИ / БАЗОВІ МЕТРИКИ
-    # ----------------------------
-    try:
-        await _apply_win_metrics(tg_id, mob)
-    except Exception:
-        logger.exception("battle: metrics apply FAILED tg_id={} mob={}", tg_id, mob)
-
-    # ----------------------------
-    # XP
-    # ----------------------------
-    try:
-        xp_gain, _, _, _ = await grant_xp_for_win(tg_id, mob.code)
-        if xp_gain > 0:
-            loot.append(f"XP +{xp_gain}")
-            try:
-                await inc_metric(tg_id, "xp_from_battles", int(xp_gain))
-            except Exception:
-                logger.exception(
-                    "battle: metric xp_from_battles FAILED tg_id={} xp={}",
-                    tg_id,
-                    xp_gain,
-                )
-    except Exception:
-        logger.exception("battle: grant_xp_for_win FAILED tg_id={} mob={}", tg_id, mob)
-
-    # ----------------------------
-    # Fort XP
-    # ----------------------------
-    try:
-        g_gain, level_up, _ = await add_fort_xp_for_kill(tg_id, mob.code)
-        if g_gain > 0:
-            loot.append(f"Застава XP +{g_gain}")
-            if level_up:
-                loot.append(f"Застава отримала рівень {level_up}!")
-            try:
-                await inc_metric(tg_id, "fort_xp_from_kills", int(g_gain))
-            except Exception:
-                logger.exception(
-                    "battle: metric fort_xp_from_kills FAILED tg_id={} gain={}",
-                    tg_id,
-                    g_gain,
-                )
-    except Exception:
-        logger.exception("battle: add_fort_xp_for_kill FAILED tg_id={} mob={}", tg_id, mob)
-
-    # ----------------------------
-    # Coins
-    # ----------------------------
-    coins = max(1, 3 + int(mob.level or 1) * 2)
-    try:
-        pool = await get_pool()
-        await pool.execute(
+    if coins > 0:
+        await conn.execute(
             "UPDATE players SET chervontsi = chervontsi + $2 WHERE tg_id = $1",
             tg_id,
-            coins,
+            int(coins),
         )
-        loot.append(f"Червонці +{coins}")
-        try:
-            await inc_metric(tg_id, "coins_from_battles", int(coins))
-        except Exception:
-            logger.exception(
-                "battle: metric coins_from_battles FAILED tg_id={} coins={}",
-                tg_id,
-                coins,
-            )
-    except Exception:
-        logger.exception("battle: update chervontsi FAILED tg_id={} coins={}", tg_id, coins)
 
-    # ----------------------------
-    # Night watch medal
-    # ----------------------------
-    try:
-        medal = roll_medal(int(mob.level or 1))
-        await report_kill(tg_id, int(mob.level or 1), int(mob.hp_max or mob.hp or 1), medal)
-        if medal:
-            loot.append("🏅 Медаль Сторожа")
-            try:
-                await inc_metric(tg_id, "nightwatch_medals", 1)
-            except Exception:
-                logger.exception("battle: metric nightwatch_medals FAILED tg_id={}", tg_id)
-    except Exception:
-        logger.exception("battle: night_watch report FAILED tg_id={} mob={}", tg_id, mob)
 
-    # ----------------------------
-    # Items loot
-    # ----------------------------
+async def check_and_grant(
+    tg_id: int,
+    changed_metric_keys: Optional[List[str]] = None,
+) -> List[str]:
+    """
+    Перевіряє каталог (services/achievements/catalog.py) і видає нагороди ОДНОРАЗОВО.
+    Повертає повідомлення, які можна додати в loot/попап.
+
+    changed_metric_keys:
+      - якщо передати, перевіряє тільки ачівки, що залежать від цих метрик (швидше)
+      - якщо None, перевіряє всі ачівки (корисно для ресинху/адмінки)
+    """
+    if tg_id <= 0:
+        return []
+
+    by_metric = achievements_by_metric()
+
+    # 1) визначаємо кандидатів
+    candidate: List[AchievementDef] = []
+    if changed_metric_keys:
+        seen: Set[str] = set()
+        for mk in changed_metric_keys:
+            for a in by_metric.get(str(mk), []):
+                if a.key not in seen:
+                    seen.add(a.key)
+                    candidate.append(a)
+    else:
+        # всі ачівки (унікалізація)
+        uniq: Dict[str, AchievementDef] = {}
+        for lst in by_metric.values():
+            for a in lst:
+                uniq[a.key] = a
+        candidate = list(uniq.values())
+
+    if not candidate:
+        return []
+
+    messages: List[str] = []
+    kleynody_to_add_total = 0
+
+    pool = await get_pool()
     try:
-        drop_names = await reward_items_new(tg_id, mob)
-        if drop_names:
-            loot.extend(drop_names)
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                metrics = await _get_metrics_map(conn, tg_id)
+
+                for a in candidate:
+                    cur = int(metrics.get(a.metric_key, 0))
+                    if cur < int(a.need):
+                        continue
+
+                    ev = _event_key_for_achv(a.key)
+
+                    # ✅ одноразово
+                    first = await _try_mark_event_once_tx(conn, tg_id, ev)
+                    if not first:
+                        continue
+
+                    # ✅ видача монет атомарно
+                    await _grant_reward_tx(conn, tg_id, int(a.reward.coins),)
+
+                    # ✅ клейноди після транзакції
+                    if a.reward.kleynody:
+                        kleynody_to_add_total += int(a.reward.kleynody)
+
+                    messages.append(_format_unlock_message(a))
+
+    except Exception:
+        logger.exception("achievements.check_and_grant FAILED tg_id={}", tg_id)
+        return []
+
+    # ✅ клейноди після commit
+    if kleynody_to_add_total > 0:
+        if add_kleynody:
             try:
-                await inc_metric(tg_id, "loot_drops_total", int(len(drop_names)))
+                await add_kleynody(tg_id, int(kleynody_to_add_total))
             except Exception:
                 logger.exception(
-                    "battle: metric loot_drops_total FAILED tg_id={} n={}",
+                    "achievements: add_kleynody FAILED tg_id={} n={}",
                     tg_id,
-                    len(drop_names),
+                    kleynody_to_add_total,
                 )
-    except Exception:
-        logger.exception("battle: reward_items_new FAILED tg_id={} mob={}", tg_id, mob)
+        else:
+            logger.warning(
+                "achievements: kleynody reward requested but services.wallet.add_kleynody is missing"
+            )
 
-    # ----------------------------
-    # ✅ Перевірка/видача ачівок (після всіх інкрементів)
-    # ----------------------------
-    try:
-        achv_msgs = await check_and_grant(
-            tg_id,
-            changed_metric_keys=[
-                "battles_won",
-                "kills_total",
-                "coins_from_battles",
-                "xp_from_battles",
-                "loot_drops_total",
-                "nightwatch_medals",
-            ],
-        )
-        if achv_msgs:
-            loot.extend(achv_msgs)
-    except Exception:
-        logger.exception("battle: check_and_grant FAILED tg_id={}", tg_id)
-
-    if not loot:
-        loot.append("Трофей ×1")
-
-    return loot
+    return messages
