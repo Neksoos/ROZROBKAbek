@@ -14,7 +14,8 @@ from services.loot import get_loot_for_mob  # type: ignore
 
 from services.battle.models import Mob
 
-from services.achievements.metrics import inc_metric, try_mark_event_once  # ✅ achievements
+from services.achievements.metrics import inc_metric, try_mark_event_once  # ✅ metrics + idempotency
+from services.achievements.service import check_and_grant  # ✅ unlock + rewards + messages
 
 try:
     from services.night_watch import roll_medal, report_kill  # type: ignore
@@ -46,7 +47,6 @@ async def reward_items_new(tg_id: int, mob: Mob) -> List[str]:
 
 
 def _normalize_area_for_metric(area: Optional[str]) -> str:
-    # щоб ключі були стабільні та без None
     a = (area or "unknown").strip().lower()
     if not a:
         a = "unknown"
@@ -77,25 +77,23 @@ async def _apply_win_metrics(tg_id: int, mob: Mob) -> None:
 async def reward_for_win(tg_id: int, mob: Mob, battle_id: Optional[int] = None) -> List[str]:
     """
     Видає нагороди за перемогу.
-    ✅ Вбудовано ачівки через метрики.
-    ✅ Ідемпотентність, якщо передано battle_id (РЕКОМЕНДОВАНО).
+    ✅ Метрики для ачівок.
+    ✅ Ідемпотентність якщо передано battle_id (РЕКОМЕНДОВАНО).
+    ✅ Повертає рядки лута + рядки "🏆 Досягнення..." (якщо відкрились).
     """
     loot: List[str] = []
 
     # ----------------------------
     # ✅ ІДЕМПОТЕНТНІСТЬ
     # ----------------------------
-    # Якщо battle_id не передали, ми НЕ можемо 100% захиститись від повторного виклику.
-    # Якщо battle_id є — блокуємо повтори повністю.
     if battle_id is not None:
         event_key = f"battle_win_reward:{int(battle_id)}"
         first = await try_mark_event_once(tg_id, event_key)
         if not first:
-            # Не даємо повторно ні метрики, ні XP, ні лут.
             return ["Нагорода вже видана."]
 
     # ----------------------------
-    # ✅ АЧІВКИ / МЕТРИКИ
+    # ✅ АЧІВКИ / БАЗОВІ МЕТРИКИ
     # ----------------------------
     try:
         await _apply_win_metrics(tg_id, mob)
@@ -112,7 +110,11 @@ async def reward_for_win(tg_id: int, mob: Mob, battle_id: Optional[int] = None) 
             try:
                 await inc_metric(tg_id, "xp_from_battles", int(xp_gain))
             except Exception:
-                logger.exception("battle: metric xp_from_battles FAILED tg_id={} xp={}", tg_id, xp_gain)
+                logger.exception(
+                    "battle: metric xp_from_battles FAILED tg_id={} xp={}",
+                    tg_id,
+                    xp_gain,
+                )
     except Exception:
         logger.exception("battle: grant_xp_for_win FAILED tg_id={} mob={}", tg_id, mob)
 
@@ -128,7 +130,11 @@ async def reward_for_win(tg_id: int, mob: Mob, battle_id: Optional[int] = None) 
             try:
                 await inc_metric(tg_id, "fort_xp_from_kills", int(g_gain))
             except Exception:
-                logger.exception("battle: metric fort_xp_from_kills FAILED tg_id={} gain={}", tg_id, g_gain)
+                logger.exception(
+                    "battle: metric fort_xp_from_kills FAILED tg_id={} gain={}",
+                    tg_id,
+                    g_gain,
+                )
     except Exception:
         logger.exception("battle: add_fort_xp_for_kill FAILED tg_id={} mob={}", tg_id, mob)
 
@@ -147,7 +153,11 @@ async def reward_for_win(tg_id: int, mob: Mob, battle_id: Optional[int] = None) 
         try:
             await inc_metric(tg_id, "coins_from_battles", int(coins))
         except Exception:
-            logger.exception("battle: metric coins_from_battles FAILED tg_id={} coins={}", tg_id, coins)
+            logger.exception(
+                "battle: metric coins_from_battles FAILED tg_id={} coins={}",
+                tg_id,
+                coins,
+            )
     except Exception:
         logger.exception("battle: update chervontsi FAILED tg_id={} coins={}", tg_id, coins)
 
@@ -176,9 +186,33 @@ async def reward_for_win(tg_id: int, mob: Mob, battle_id: Optional[int] = None) 
             try:
                 await inc_metric(tg_id, "loot_drops_total", int(len(drop_names)))
             except Exception:
-                logger.exception("battle: metric loot_drops_total FAILED tg_id={} n={}", tg_id, len(drop_names))
+                logger.exception(
+                    "battle: metric loot_drops_total FAILED tg_id={} n={}",
+                    tg_id,
+                    len(drop_names),
+                )
     except Exception:
         logger.exception("battle: reward_items_new FAILED tg_id={} mob={}", tg_id, mob)
+
+    # ----------------------------
+    # ✅ Перевірка/видача ачівок (після всіх інкрементів)
+    # ----------------------------
+    try:
+        achv_msgs = await check_and_grant(
+            tg_id,
+            changed_metric_keys=[
+                "battles_won",
+                "kills_total",
+                "coins_from_battles",
+                "xp_from_battles",
+                "loot_drops_total",
+                "nightwatch_medals",
+            ],
+        )
+        if achv_msgs:
+            loot.extend(achv_msgs)
+    except Exception:
+        logger.exception("battle: check_and_grant FAILED tg_id={}", tg_id)
 
     if not loot:
         loot.append("Трофей ×1")
