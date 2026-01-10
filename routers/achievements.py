@@ -1,7 +1,7 @@
 # routers/achievements.py
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException
@@ -18,7 +18,6 @@ router = APIRouter(prefix="/api/achievements", tags=["achievements"])
 # ─────────────────────────────────────────────
 
 class RewardDTO(BaseModel):
-    # залишаємо максимально гнучко, бо у вас можуть бути різні валюти/бейджі/титули
     chervontsi: int = 0
     kleynody: int = 0
     badge: Optional[str] = None
@@ -80,6 +79,11 @@ class ClaimResponse(BaseModel):
 # ─────────────────────────────────────────────
 
 async def ensure_achievements_tables() -> None:
+    """
+    ВАЖЛИВО:
+    - player_metrics / player_events НЕ створюємо тут, бо вони вже є з міграції achievements.
+    - Метрики використовують колонку val.
+    """
     pool = await get_pool()
     async with pool.acquire() as conn:
         await conn.execute(
@@ -100,18 +104,6 @@ async def ensure_achievements_tables() -> None:
 
         await conn.execute(
             """
-            CREATE TABLE IF NOT EXISTS player_metrics (
-              tg_id bigint NOT NULL,
-              key text NOT NULL,
-              value bigint NOT NULL DEFAULT 0,
-              updated_at timestamptz NOT NULL DEFAULT now(),
-              PRIMARY KEY (tg_id, key)
-            );
-            """
-        )
-
-        await conn.execute(
-            """
             CREATE TABLE IF NOT EXISTS player_achievement_claims (
               tg_id bigint NOT NULL,
               achievement_code text NOT NULL REFERENCES achievements(code) ON DELETE CASCADE,
@@ -122,15 +114,19 @@ async def ensure_achievements_tables() -> None:
             """
         )
 
+        # індекси
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_ach_metric ON achievements(metric_key);")
-        await conn.execute("CREATE INDEX IF NOT EXISTS idx_metrics_tg ON player_metrics(tg_id);")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_claims_tg ON player_achievement_claims(tg_id);")
+
+        # (опційно) корисно для читання метрик по ключу
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_player_metrics_key ON player_metrics(key);")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_player_events_event_key ON player_events(event_key);")
 
 
 async def seed_achievements_if_empty() -> None:
     """
-    Мінімальний seed (ти потім підставиш свій JSON повністю).
-    ВАЖЛИВО: tiers зберігаємо як jsonb масив об'єктів:
+    Мінімальний seed (приклад).
+    tiers: jsonb масив об'єктів:
       [{"tier":1,"target":10,"reward":{"chervontsi":120,"badge":null,"title":null,"kleynody":0}}, ...]
     """
     pool = await get_pool()
@@ -139,7 +135,6 @@ async def seed_achievements_if_empty() -> None:
         if row and int(row["c"] or 0) > 0:
             return
 
-        # мінімальний набір (приклад)
         await conn.execute(
             """
             INSERT INTO achievements(code, name, category, description, metric_key, claim_once_per_tier, tiers)
@@ -188,12 +183,13 @@ async def seed_achievements_if_empty() -> None:
 # helpers
 # ─────────────────────────────────────────────
 
-async def get_metric(conn: Any, tg_id: int, key: str) -> int:
-    v = await conn.fetchval("SELECT value FROM player_metrics WHERE tg_id=$1 AND key=$2", tg_id, key)
+async def get_metric_val(conn: Any, tg_id: int, key: str) -> int:
+    # ✅ у вашій схемі це val, не value
+    v = await conn.fetchval("SELECT val FROM player_metrics WHERE tg_id=$1 AND key=$2", tg_id, key)
     return int(v or 0)
 
 
-async def get_claimed_set(conn: Any, tg_id: int) -> set[tuple[str, int]]:
+async def get_claimed_set(conn: Any, tg_id: int) -> Set[Tuple[str, int]]:
     rows = await conn.fetch(
         "SELECT achievement_code, tier FROM player_achievement_claims WHERE tg_id=$1",
         tg_id,
@@ -275,14 +271,13 @@ async def status(tg_id: int) -> List[AchievementStatusDTO]:
         )
         claimed = await get_claimed_set(conn, tg_id)
 
-        # оптимізація: унікальні metric_key одним запитом
         metric_keys = sorted({str(r["metric_key"]) for r in ach_rows})
         metric_rows = await conn.fetch(
-            "SELECT key, value FROM player_metrics WHERE tg_id=$1 AND key = ANY($2::text[])",
+            "SELECT key, val FROM player_metrics WHERE tg_id=$1 AND key = ANY($2::text[])",
             tg_id,
             metric_keys,
         )
-        metric_map = {str(m["key"]): int(m["value"] or 0) for m in (metric_rows or [])}
+        metric_map = {str(m["key"]): int(m["val"] or 0) for m in (metric_rows or [])}
 
     out: List[AchievementStatusDTO] = []
     for a in ach_rows:
@@ -331,12 +326,14 @@ async def claim(tg_id: int, body: ClaimBody) -> ClaimResponse:
     await seed_achievements_if_empty()
 
     pool = await get_pool()
+    reward: RewardDTO
+
     try:
         async with pool.acquire() as conn:
             async with conn.transaction():
                 a = await conn.fetchrow(
                     """
-                    SELECT code, name, metric_key, tiers
+                    SELECT code, metric_key, tiers
                     FROM achievements
                     WHERE code=$1
                     FOR UPDATE
@@ -346,7 +343,6 @@ async def claim(tg_id: int, body: ClaimBody) -> ClaimResponse:
                 if not a:
                     raise HTTPException(404, "ACHIEVEMENT_NOT_FOUND")
 
-                # вже забрано?
                 already = await conn.fetchval(
                     """
                     SELECT 1
@@ -360,8 +356,8 @@ async def claim(tg_id: int, body: ClaimBody) -> ClaimResponse:
                 if already:
                     raise HTTPException(400, "TIER_ALREADY_CLAIMED")
 
-                key = str(a["metric_key"])
-                cur = await get_metric(conn, tg_id, key)
+                metric_key = str(a["metric_key"])
+                cur = await get_metric_val(conn, tg_id, metric_key)
 
                 tiers_raw = list(a["tiers"] or [])
                 tier_obj = None
@@ -378,6 +374,7 @@ async def claim(tg_id: int, body: ClaimBody) -> ClaimResponse:
 
                 reward = _parse_reward(dict(tier_obj.get("reward") or {}))
 
+                # ✅ запис claim
                 await conn.execute(
                     """
                     INSERT INTO player_achievement_claims(tg_id, achievement_code, tier, claimed_at)
@@ -389,15 +386,20 @@ async def claim(tg_id: int, body: ClaimBody) -> ClaimResponse:
                     datetime.now(timezone.utc),
                 )
 
+                # ✅ ВИДАЧА НАГОРОДИ ТУТ (щоб було атомарно)
+                if reward.chervontsi > 0:
+                    await conn.execute(
+                        "UPDATE players SET chervontsi = chervontsi + $2 WHERE tg_id = $1",
+                        tg_id,
+                        int(reward.chervontsi),
+                    )
+
+                # ⚠️ kleynody/badge/title: якщо у вас є окремі таблиці/сервіси — підключиш тут.
+
     except HTTPException:
         raise
     except Exception as e:
         logger.exception("achievement claim failed")
         raise HTTPException(500, detail={"code": "ACH_CLAIM_INTERNAL", "error": str(e)})
-
-    # ⚠️ Нагороду тут ВИДАВАТИ треба через ваші сервіси валюти/профілю.
-    # Я залишив як "повертаємо що треба видати", а ти підключиш реальну видачу:
-    # - додати chervontsi (або іншу валюту)
-    # - зберегти badge/title в профіль (якщо у вас таке є)
 
     return ClaimResponse(ok=True, achievement_code=body.achievement_code, tier=int(body.tier), granted=reward)
