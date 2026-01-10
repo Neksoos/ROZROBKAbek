@@ -1,15 +1,18 @@
 # services/perun_elo.py
 from __future__ import annotations
 
-from typing import Optional, Dict, List, Tuple
 from dataclasses import dataclass
-from loguru import logger
 from math import pow
+from typing import List, Optional, Tuple
 
+from loguru import logger
+
+# ✅ ЄДИНИЙ правильний pool у твоєму проєкті
 try:
-    from ..database import get_pool  # type: ignore
+    from db import get_pool  # type: ignore
 except Exception:
-    get_pool = None
+    get_pool = None  # type: ignore
+
 
 # ────────────────────────────────────────────────────────────────────
 # Параметри системи рейтингів Перуна (ELO)
@@ -66,7 +69,7 @@ async def _ensure_row(conn, tg_id: int) -> None:
         VALUES ($1)
         ON CONFLICT (tg_id) DO NOTHING
         """,
-        tg_id,
+        int(tg_id),
     )
 
 
@@ -104,18 +107,19 @@ async def _fetch_row(conn, tg_id: int) -> EloRow:
         SELECT tg_id, elo_day, elo_week, elo_month, elo_all, wins, losses
         FROM perun_elo
         WHERE tg_id=$1
-        """, tg_id
+        """,
+        int(tg_id),
     )
     if not row:
-        return EloRow(tg_id, ELO_START, ELO_START, ELO_START, ELO_START, 0, 0)
+        return EloRow(int(tg_id), ELO_START, ELO_START, ELO_START, ELO_START, 0, 0)
     return EloRow(
-        tg_id=row["tg_id"],
-        elo_day=row["elo_day"],
-        elo_week=row["elo_week"],
-        elo_month=row["elo_month"],
-        elo_all=row["elo_all"],
-        wins=row["wins"],
-        losses=row["losses"],
+        tg_id=int(row["tg_id"]),
+        elo_day=int(row["elo_day"]),
+        elo_week=int(row["elo_week"]),
+        elo_month=int(row["elo_month"]),
+        elo_all=int(row["elo_all"]),
+        wins=int(row["wins"]),
+        losses=int(row["losses"]),
     )
 
 
@@ -132,6 +136,12 @@ async def record_duel_result(winner_id: int, loser_id: int) -> None:
         return
     if not await ensure_schema():
         return
+
+    winner_id = int(winner_id)
+    loser_id = int(loser_id)
+    if winner_id <= 0 or loser_id <= 0 or winner_id == loser_id:
+        return
+
     try:
         pool = await get_pool()
         async with pool.acquire() as conn:
@@ -166,19 +176,25 @@ async def record_duel_result(winner_id: int, loser_id: int) -> None:
                 nw_a = _apply_elo(w.elo_all, e_w, 1.0, K_FACTORS["all"])
                 nl_a = _apply_elo(l.elo_all, e_l, 0.0, K_FACTORS["all"])
 
-                await conn.execute("""
+                await conn.execute(
+                    """
                     UPDATE perun_elo
                     SET elo_day=$2, elo_week=$3, elo_month=$4, elo_all=$5,
                         wins=wins+1, updated_at=now()
                     WHERE tg_id=$1
-                """, winner_id, nw_d, nw_w, nw_m, nw_a)
+                    """,
+                    winner_id, nw_d, nw_w, nw_m, nw_a,
+                )
 
-                await conn.execute("""
+                await conn.execute(
+                    """
                     UPDATE perun_elo
                     SET elo_day=$2, elo_week=$3, elo_month=$4, elo_all=$5,
                         losses=losses+1, updated_at=now()
                     WHERE tg_id=$1
-                """, loser_id, nl_d, nl_w, nl_m, nl_a)
+                    """,
+                    loser_id, nl_d, nl_w, nl_m, nl_a,
+                )
     except Exception as e:
         logger.warning(f"perun_elo.record_duel_result failed: {e}")
 
@@ -202,10 +218,6 @@ async def reset_period(period: str) -> None:
         logger.warning(f"perun_elo.reset_period({period}) failed: {e}")
 
 
-# ────────────────────────────────────────────────────────────────────
-# Додаткові утиліти (зручно для API/адмінки)
-# ────────────────────────────────────────────────────────────────────
-
 async def get_player_elo(tg_id: int) -> Optional[EloRow]:
     """
     Прочитати поточні рейтинги гравця. Якщо рядка немає — повертає стартові значення.
@@ -217,8 +229,8 @@ async def get_player_elo(tg_id: int) -> Optional[EloRow]:
     try:
         pool = await get_pool()
         async with pool.acquire() as conn:
-            await _ensure_row(conn, tg_id)
-            return await _fetch_row(conn, tg_id)
+            await _ensure_row(conn, int(tg_id))
+            return await _fetch_row(conn, int(tg_id))
     except Exception as e:
         logger.warning(f"perun_elo.get_player_elo failed: {e}")
         return None
@@ -227,8 +239,7 @@ async def get_player_elo(tg_id: int) -> Optional[EloRow]:
 async def top(period: str, limit: int = 20) -> List[Tuple[int, int, int, int, int, int]]:
     """
     Топ за періодом ('day'/'week'/'month'/'all').
-    Повертає список кортежів: (tg_id, elo_day, elo_week, elo_month, elo_all, wins)
-    Відсортовано за відповідною шкалою спадаюче, а далі wins DESC.
+    Повертає: (tg_id, elo_day, elo_week, elo_month, elo_all, wins)
     """
     if period not in ("day", "week", "month", "all"):
         period = "all"
@@ -248,7 +259,7 @@ async def top(period: str, limit: int = 20) -> List[Tuple[int, int, int, int, in
                 ORDER BY {order_col} DESC, wins DESC, tg_id ASC
                 LIMIT $1
                 """,
-                limit,
+                int(limit),
             )
             return [
                 (
