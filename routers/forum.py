@@ -1,6 +1,7 @@
 # routers/forum.py
 from __future__ import annotations
 
+from datetime import timedelta
 from typing import List, Optional, Dict, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Header, Query, Path
@@ -183,7 +184,6 @@ def _snippet(s: str, n: int = 80) -> str:
 
 
 def _is_ua_letter(ch: str) -> bool:
-    # UA + базова кирилиця (щоб не відрізати “ґ/є/і/ї”)
     return (
         ("а" <= ch <= "я")
         or ch in ("ґ", "є", "і", "ї", "ь")
@@ -193,10 +193,6 @@ def _is_ua_letter(ch: str) -> bool:
 
 
 def _make_slug(title: str) -> str:
-    """
-    Кириличний slug: лишаємо українські/кириличні літери, латиницю, цифри.
-    Розділювач — дефіс. Все інше -> дефіс, подвійні дефіси стискаємо.
-    """
     s = (title or "").strip().lower()
 
     out: list[str] = []
@@ -208,22 +204,21 @@ def _make_slug(title: str) -> str:
             prev_dash = False
             continue
 
-        # дозволимо дефіс як є
         if ch == "-":
             if not prev_dash and out:
                 out.append("-")
                 prev_dash = True
             continue
 
-        # пробіли/пунктуація/підкреслення -> дефіс
-        if ch.isspace() or ch in ("_", ".", ",", ":", ";", "!", "?", "/", "\\", "|", "+", "=", "(", ")", "[", "]", "{", "}", '"', "'", "«", "»"):
+        if ch.isspace() or ch in (
+            "_", ".", ",", ":", ";", "!", "?", "/", "\\", "|", "+", "=", "(",
+            ")", "[", "]", "{", "}", '"', "'", "«", "»"
+        ):
             if not prev_dash and out:
                 out.append("-")
                 prev_dash = True
             continue
 
-        # інші символи (emoji тощо) — просто пропускаємо або замінюємо на дефіс,
-        # але без спаму дефісами
         if not prev_dash and out:
             out.append("-")
             prev_dash = True
@@ -254,7 +249,6 @@ async def _send_forum_reply_mail(
         f"{_snippet(reply_text, 400)}"
     )
 
-    # schema A
     try:
         await conn.execute(
             """
@@ -270,7 +264,6 @@ async def _send_forum_reply_mail(
     except Exception:
         pass
 
-    # schema B
     try:
         await conn.execute(
             """
@@ -322,16 +315,17 @@ async def create_category_paid(payload: CategoryCreatePaidRequest, me: int = Dep
         if lvl < FORUM_CAT_MIN_LEVEL:
             raise HTTPException(403, detail=f"MIN_LEVEL_{FORUM_CAT_MIN_LEVEL}")
 
-        # 2) кулдаун
+        # 2) ✅ кулдаун (FIX: interval параметр має бути timedelta, не str)
         recent = await conn.fetchval(
             """
             SELECT 1
             FROM forum_category_creations
-            WHERE creator_tg=$1 AND created_at > now() - ($2::interval)
+            WHERE creator_tg=$1
+              AND created_at > now() - $2
             LIMIT 1
             """,
             me,
-            f"{FORUM_CAT_COOLDOWN_HOURS} hours",
+            timedelta(hours=FORUM_CAT_COOLDOWN_HOURS),
         )
         if recent:
             raise HTTPException(429, detail="CATEGORY_CREATE_COOLDOWN")
@@ -400,6 +394,9 @@ async def create_category_paid(payload: CategoryCreatePaidRequest, me: int = Dep
                 sort_order,
                 me,
             )
+            if not crow:
+                raise HTTPException(status_code=500, detail="CATEGORY_CREATE_FAILED")
+
             cat_id = int(crow["id"])
 
             await conn.execute(
@@ -454,9 +451,7 @@ async def list_topics(
 
         where_sql = " WHERE " + " AND ".join(where)
 
-        if order == "new":
-            order_sql = " ORDER BY ft.created_at DESC"
-        elif order == "mine":
+        if order in ("new", "mine"):
             order_sql = " ORDER BY ft.created_at DESC"
         else:
             order_sql = " ORDER BY ft.is_pinned DESC, ft.replies_cnt DESC, ft.last_post_at DESC"
