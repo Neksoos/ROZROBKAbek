@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, Header, Query, Path
 from pydantic import BaseModel, Field
@@ -72,6 +72,12 @@ class PostDTO(BaseModel):
     updated_at: str
     is_deleted: bool
 
+    # ✅ reply-to
+    reply_to_post_id: Optional[int] = None
+    reply_to_author_tg: Optional[int] = None
+    reply_to_author_name: Optional[str] = None
+    reply_to_body_snippet: Optional[str] = None
+
     # ✅ ЛИШЕ "подяки"
     likes_cnt: int = 0
     liked: bool = False
@@ -102,6 +108,7 @@ class TopicCreateRequest(BaseModel):
 
 class PostCreateRequest(BaseModel):
     body: str = Field(..., min_length=1, max_length=4000)
+    reply_to_post_id: Optional[int] = Field(default=None, ge=1)
 
 
 # ✅ ЛИШЕ "подяки"
@@ -135,12 +142,77 @@ async def _get_player_brief(conn, tg_id: int) -> tuple[str, int]:
 
 async def _topic_exists(conn, topic_id: int) -> Dict[str, Any]:
     row = await conn.fetchrow(
-        "SELECT id, is_deleted, is_closed FROM forum_topics WHERE id=$1",
+        "SELECT id, is_deleted, is_closed, title FROM forum_topics WHERE id=$1",
         topic_id,
     )
     if not row or bool(row["is_deleted"]):
         raise HTTPException(status_code=404, detail="TOPIC_NOT_FOUND")
     return dict(row)
+
+
+def _snippet(s: str, n: int = 80) -> str:
+    s = (s or "").strip().replace("\n", " ")
+    if len(s) <= n:
+        return s
+    return s[: n - 1] + "…"
+
+
+async def _send_forum_reply_mail(
+    conn,
+    *,
+    sender_tg: int,
+    sender_name: str,
+    recipient_tg: int,
+    recipient_name: str,
+    topic_title: str,
+    reply_text: str,
+) -> None:
+    """
+    Safe insert into mail_messages with fallback for different schemas.
+    """
+    if recipient_tg <= 0 or recipient_tg == sender_tg:
+        return
+
+    body = (
+        f"💬 Відповідь на форумі\n"
+        f"Тема: {topic_title}\n"
+        f"Від: {sender_name}\n\n"
+        f"{_snippet(reply_text, 400)}"
+    )
+
+    # try schema A
+    try:
+        await conn.execute(
+            """
+            INSERT INTO mail_messages(sender_tg, recipient_tg, body, created_at, is_read, deleted_by_recipient, sender_name)
+            VALUES ($1, $2, $3, now(), FALSE, FALSE, $4)
+            """,
+            sender_tg,
+            recipient_tg,
+            body,
+            sender_name,
+        )
+        return
+    except Exception:
+        pass
+
+    # try schema B (older / mixed columns seen in your screenshots)
+    try:
+        await conn.execute(
+            """
+            INSERT INTO mail_messages(sender_tg, rcpt_tg, rcpt_name, sender_name, body, sent_at, deleted_in, deleted_out, deleted_by_recipient, is_read)
+            VALUES ($1, $2, $3, $4, $5, now(), FALSE, FALSE, FALSE, FALSE)
+            """,
+            sender_tg,
+            recipient_tg,
+            recipient_name,
+            sender_name,
+            body,
+        )
+        return
+    except Exception:
+        # don't break forum posting because of mail
+        return
 
 
 # ─────────────────────────────────────────────
@@ -243,7 +315,6 @@ async def create_topic(payload: TopicCreateRequest, me: int = Depends(get_tg_id)
 
     pool = await get_pool()
     async with pool.acquire() as conn:
-        # category exists?
         cat = await conn.fetchval(
             "SELECT 1 FROM forum_categories WHERE id=$1 AND is_hidden=FALSE",
             payload.category_id,
@@ -280,11 +351,10 @@ async def create_topic(payload: TopicCreateRequest, me: int = Depends(get_tg_id)
 
             topic_id = int(trow["id"])
 
-            # first post
             await conn.execute(
                 """
-                INSERT INTO forum_posts(topic_id, author_tg, body)
-                VALUES ($1, $2, $3)
+                INSERT INTO forum_posts(topic_id, author_tg, body, reply_to_post_id)
+                VALUES ($1, $2, $3, NULL)
                 """,
                 topic_id,
                 me,
@@ -308,12 +378,12 @@ async def create_topic(payload: TopicCreateRequest, me: int = Depends(get_tg_id)
 
 
 # ─────────────────────────────────────────────
-# Get topic + posts
+# Get topic + posts (with reply-to info)
 # ─────────────────────────────────────────────
 @router.get("/topics/{topic_id}", response_model=TopicWithPostsResponse)
 async def get_topic(
     topic_id: int = Path(..., ge=1),
-    me: int = Depends(get_tg_id),  # ✅ тепер використовується лише для "liked"
+    me: int = Depends(get_tg_id),
     page: int = Query(default=1, ge=1),
     per_page: int = Query(default=20, ge=1, le=50),
 ):
@@ -347,8 +417,6 @@ async def get_topic(
         if not trow or bool(trow["is_deleted"]):
             raise HTTPException(status_code=404, detail="TOPIC_NOT_FOUND")
 
-        # ✅ ВАЖЛИВО: перший пост вже показуємо як topic.body,
-        # тому в списку replies його прибираємо, щоб не було дубля.
         first_post_id = await conn.fetchval(
             """
             SELECT id
@@ -361,7 +429,6 @@ async def get_topic(
         )
         first_post_id = int(first_post_id or 0)
 
-        # ✅ тут лише додано likes_cnt + liked, все інше як було
         rows = await conn.fetch(
             """
             SELECT
@@ -375,11 +442,19 @@ async def get_topic(
               fp.updated_at::TEXT AS updated_at,
               fp.is_deleted,
 
+              fp.reply_to_post_id,
+              rp.author_tg AS reply_to_author_tg,
+              COALESCE(rpp.name,'') AS reply_to_author_name,
+              LEFT(COALESCE(rp.body,''), 120) AS reply_to_body_snippet,
+
               COALESCE(lc.likes_cnt, 0) AS likes_cnt,
               CASE WHEN ml.post_id IS NULL THEN FALSE ELSE TRUE END AS liked
 
             FROM forum_posts fp
             LEFT JOIN players p ON p.tg_id = fp.author_tg
+
+            LEFT JOIN forum_posts rp ON rp.id = fp.reply_to_post_id
+            LEFT JOIN players rpp ON rpp.tg_id = rp.author_tg
 
             LEFT JOIN (
               SELECT post_id, COUNT(1)::INT AS likes_cnt
@@ -392,7 +467,7 @@ async def get_topic(
 
             WHERE fp.topic_id=$1
               AND fp.is_deleted=FALSE
-              AND ($5 = 0 OR fp.id <> $5)   -- ✅ прибрали перший пост
+              AND ($5 = 0 OR fp.id <> $5)
             ORDER BY fp.created_at ASC
             LIMIT $3 OFFSET $4
             """,
@@ -443,7 +518,7 @@ async def get_topic(
 
 
 # ─────────────────────────────────────────────
-# Create post (reply)
+# Create post (reply) + mail notification
 # ─────────────────────────────────────────────
 @router.post("/topics/{topic_id}/posts", response_model=PostDTO)
 async def create_post(
@@ -455,6 +530,8 @@ async def create_post(
     if not body:
         raise HTTPException(status_code=400, detail="EMPTY_BODY")
 
+    reply_to_post_id = int(payload.reply_to_post_id) if payload.reply_to_post_id else None
+
     pool = await get_pool()
     async with pool.acquire() as conn:
         topic = await _topic_exists(conn, topic_id)
@@ -463,16 +540,35 @@ async def create_post(
 
         author_name, author_level = await _get_player_brief(conn, me)
 
+        reply_target: Optional[Dict[str, Any]] = None
+        if reply_to_post_id:
+            # reply target must exist and belong to same topic
+            rrow = await conn.fetchrow(
+                """
+                SELECT fp.id, fp.topic_id, fp.author_tg, COALESCE(p.name,'') AS author_name, fp.body
+                FROM forum_posts fp
+                LEFT JOIN players p ON p.tg_id = fp.author_tg
+                WHERE fp.id=$1 AND fp.is_deleted=FALSE
+                """,
+                reply_to_post_id,
+            )
+            if not rrow:
+                raise HTTPException(status_code=404, detail="REPLY_TARGET_NOT_FOUND")
+            if int(rrow["topic_id"]) != int(topic_id):
+                raise HTTPException(status_code=400, detail="REPLY_TARGET_WRONG_TOPIC")
+            reply_target = dict(rrow)
+
         async with conn.transaction():
             prow = await conn.fetchrow(
                 """
-                INSERT INTO forum_posts(topic_id, author_tg, body)
-                VALUES ($1, $2, $3)
+                INSERT INTO forum_posts(topic_id, author_tg, body, reply_to_post_id)
+                VALUES ($1, $2, $3, $4)
                 RETURNING
                   id,
                   topic_id,
                   author_tg,
                   body,
+                  reply_to_post_id,
                   created_at::TEXT AS created_at,
                   updated_at::TEXT AS updated_at,
                   is_deleted
@@ -480,6 +576,7 @@ async def create_post(
                 topic_id,
                 me,
                 body,
+                reply_to_post_id,
             )
 
             await conn.execute(
@@ -492,7 +589,18 @@ async def create_post(
                 topic_id,
             )
 
-        # ✅ лишаємо як було; likes_cnt/liked = дефолти (0/False)
+            # ✅ Mail notification (inside same conn, but we ignore failures inside helper)
+            if reply_target:
+                await _send_forum_reply_mail(
+                    conn,
+                    sender_tg=me,
+                    sender_name=author_name,
+                    recipient_tg=int(reply_target["author_tg"] or 0),
+                    recipient_name=str(reply_target.get("author_name") or "Гравець"),
+                    topic_title=str(topic.get("title") or "Форум"),
+                    reply_text=body,
+                )
+
         return PostDTO(
             id=int(prow["id"]),
             topic_id=int(prow["topic_id"]),
@@ -503,12 +611,15 @@ async def create_post(
             created_at=str(prow["created_at"]),
             updated_at=str(prow["updated_at"]),
             is_deleted=bool(prow["is_deleted"]),
+            reply_to_post_id=int(prow["reply_to_post_id"]) if prow["reply_to_post_id"] else None,
+            reply_to_author_tg=int(reply_target["author_tg"]) if reply_target else None,
+            reply_to_author_name=str(reply_target.get("author_name") or "") if reply_target else None,
+            reply_to_body_snippet=_snippet(str(reply_target.get("body") or ""), 120) if reply_target else None,
         )
 
 
 # ─────────────────────────────────────────────
 # ✅ ЛИШЕ "подяки": toggle like
-# POST /api/forum/posts/{post_id}/like
 # ─────────────────────────────────────────────
 @router.post("/posts/{post_id}/like", response_model=PostLikeResponse)
 async def toggle_post_like(
@@ -517,7 +628,6 @@ async def toggle_post_like(
 ):
     pool = await get_pool()
     async with pool.acquire() as conn:
-        # пост існує?
         exists = await conn.fetchval(
             "SELECT 1 FROM forum_posts WHERE id=$1 AND is_deleted=FALSE",
             post_id,
