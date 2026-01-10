@@ -7,8 +7,15 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 from loguru import logger
+from starlette.requests import Request
 
 from db import get_pool
+
+# ✅ клейноди (опційно): якщо є сервіс гаманця — підключимо
+try:
+    from services.wallet import add_kleynody  # type: ignore
+except Exception:
+    add_kleynody = None  # type: ignore
 
 router = APIRouter(prefix="/api/achievements", tags=["achievements"])
 
@@ -75,6 +82,22 @@ class ClaimResponse(BaseModel):
 
 
 # ─────────────────────────────────────────────
+# AUTH HELPERS
+# ─────────────────────────────────────────────
+
+def _require_tg_id(request: Request) -> int:
+    tg_id = getattr(request.state, "tg_id", None)
+    try:
+        tg_id = int(tg_id) if tg_id is not None else 0
+    except Exception:
+        tg_id = 0
+    if tg_id <= 0:
+        # ✅ не даємо підставляти tg_id через query взагалі
+        raise HTTPException(status_code=401, detail="Missing tg id (initData required)")
+    return tg_id
+
+
+# ─────────────────────────────────────────────
 # DB ensure + seed
 # ─────────────────────────────────────────────
 
@@ -118,7 +141,7 @@ async def ensure_achievements_tables() -> None:
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_ach_metric ON achievements(metric_key);")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_claims_tg ON player_achievement_claims(tg_id);")
 
-        # (опційно) корисно для читання метрик по ключу
+        # (опційно) індекси з міграції — тут це буде no-op, але корисно якщо міграцію пропустили
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_player_metrics_key ON player_metrics(key);")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_player_events_event_key ON player_events(event_key);")
 
@@ -185,7 +208,7 @@ async def seed_achievements_if_empty() -> None:
 
 async def get_metric_val(conn: Any, tg_id: int, key: str) -> int:
     # ✅ у вашій схемі це val, не value
-    v = await conn.fetchval("SELECT val FROM player_metrics WHERE tg_id=$1 AND key=$2", tg_id, key)
+    v = await conn.fetchval("SELECT COALESCE(val,0)::bigint FROM player_metrics WHERE tg_id=$1 AND key=$2", tg_id, key)
     return int(v or 0)
 
 
@@ -253,9 +276,8 @@ async def defs() -> AchDefsResponse:
 
 
 @router.get("/status", response_model=List[AchievementStatusDTO])
-async def status(tg_id: int) -> List[AchievementStatusDTO]:
-    if tg_id <= 0:
-        raise HTTPException(400, "INVALID_TG_ID")
+async def status(request: Request) -> List[AchievementStatusDTO]:
+    tg_id = _require_tg_id(request)
 
     await ensure_achievements_tables()
     await seed_achievements_if_empty()
@@ -318,15 +340,15 @@ async def status(tg_id: int) -> List[AchievementStatusDTO]:
 
 
 @router.post("/claim", response_model=ClaimResponse)
-async def claim(tg_id: int, body: ClaimBody) -> ClaimResponse:
-    if tg_id <= 0:
-        raise HTTPException(400, "INVALID_TG_ID")
+async def claim(request: Request, body: ClaimBody) -> ClaimResponse:
+    tg_id = _require_tg_id(request)
 
     await ensure_achievements_tables()
     await seed_achievements_if_empty()
 
     pool = await get_pool()
     reward: RewardDTO
+    kleynody_to_add = 0
 
     try:
         async with pool.acquire() as conn:
@@ -386,7 +408,7 @@ async def claim(tg_id: int, body: ClaimBody) -> ClaimResponse:
                     datetime.now(timezone.utc),
                 )
 
-                # ✅ ВИДАЧА НАГОРОДИ ТУТ (щоб було атомарно)
+                # ✅ видача монет — атомарно в транзакції
                 if reward.chervontsi > 0:
                     await conn.execute(
                         "UPDATE players SET chervontsi = chervontsi + $2 WHERE tg_id = $1",
@@ -394,12 +416,25 @@ async def claim(tg_id: int, body: ClaimBody) -> ClaimResponse:
                         int(reward.chervontsi),
                     )
 
-                # ⚠️ kleynody/badge/title: якщо у вас є окремі таблиці/сервіси — підключиш тут.
+                # ✅ kleynody краще після транзакції (бо може бути інший пул/сервіс)
+                if reward.kleynody > 0:
+                    kleynody_to_add = int(reward.kleynody)
 
     except HTTPException:
         raise
     except Exception as e:
         logger.exception("achievement claim failed")
         raise HTTPException(500, detail={"code": "ACH_CLAIM_INTERNAL", "error": str(e)})
+
+    # ✅ видача клейнодів після транзакції
+    if kleynody_to_add > 0:
+        if add_kleynody:
+            try:
+                await add_kleynody(tg_id, kleynody_to_add)
+            except Exception:
+                logger.exception("achievement: add_kleynody FAILED tg_id={} n={}", tg_id, kleynody_to_add)
+                # не падаємо — claim уже записаний
+        else:
+            logger.warning("achievement: kleynody reward requested but services.wallet.add_kleynody is missing")
 
     return ClaimResponse(ok=True, achievement_code=body.achievement_code, tier=int(body.tier), granted=reward)
